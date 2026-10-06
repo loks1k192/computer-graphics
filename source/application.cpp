@@ -18,9 +18,12 @@ struct Vertex {
 };
 
 // Данные для шейдеров. Раскладка должна совпадать с uniform-блоком
-// GlobalUniforms в shaders/basic.vert по правилам std140: mat4 занимает 64 байта
+// GlobalUniforms в shaders/basic.vert по правилам std140: mat4 занимает
+// байты 0..63, vec4 — байты 64..79, поэтому выравнивающие байты не нужны.
+// Для цвета взят vec4, а не vec3, чтобы не думать о выравнивании vec3 в std140.
 struct GlobalUniforms {
 	math::Matrix4 matrix; // projection * view * model
+	float color[4];
 };
 
 // Правильный икосаэдр: 12 вершин и 20 граней (правильных треугольников).
@@ -80,6 +83,9 @@ float trajectory_radius = 1.5f;
 float trajectory_height = 0.5f;
 float animation_time = 0.0f; // собственное время анимации, на паузе не идёт
 double last_time = 0.0;
+
+// Доп. задание 4: цвет фигуры
+float color[3] = { 1.0f, 0.6f, 0.2f };
 
 graphics::Buffer vertex_buffer;
 graphics::Buffer index_buffer;
@@ -408,6 +414,9 @@ void update(double time) {
 	ImGui::SliderFloat("Radius", &trajectory_radius, 0.0f, 3.0f);
 	ImGui::SliderFloat("Wave height", &trajectory_height, 0.0f, 2.0f);
 
+	ImGui::SeparatorText("Color");
+	ImGui::ColorEdit3("Color", color);
+
 	ImGui::End();
 
 	// Доп. задание 3: время анимации идёт, только когда она не на паузе
@@ -447,6 +456,12 @@ void update(double time) {
 	}
 
 	uniforms.matrix = projection * view * model;
+
+	// Доп. задание 4: цвет из интерфейса уходит в шейдер через uniform-буфер
+	uniforms.color[0] = color[0];
+	uniforms.color[1] = color[1];
+	uniforms.color[2] = color[2];
+	uniforms.color[3] = 1.0f;
 }
 
 void render(const graphics::internal::FrameData& fd) {
