@@ -60,7 +60,13 @@ constexpr uint32_t index_count = sizeof(indices) / sizeof(indices[0]);
 constexpr float camera_distance = 6.0f;
 constexpr float z_near = 0.1f;
 constexpr float z_far = 100.0f;
-constexpr float fov_degrees = 60.0f;
+
+// Параметры, которые меняются через интерфейс
+
+// Доп. задание 1: тип проекции (0 — перспективная, 1 — ортографическая)
+int projection_type = 0;
+float fov_degrees = 60.0f; // вертикальный угол обзора перспективной проекции
+float ortho_size = 7.0f;   // высота видимой области ортографической проекции
 
 graphics::Buffer vertex_buffer;
 graphics::Buffer index_buffer;
@@ -360,8 +366,19 @@ void shutdown() {
 }
 
 void update(double time) {
-	const VkExtent2D extent = graphics::internal::context.swapchain_extent;
-	const float aspect = float(extent.width) / float(extent.height);
+	ImGui::Begin("Icosahedron");
+
+	ImGui::SeparatorText("Projection");
+	ImGui::RadioButton("Perspective", &projection_type, 0);
+	ImGui::SameLine();
+	ImGui::RadioButton("Orthographic", &projection_type, 1);
+	if (projection_type == 0) {
+		ImGui::SliderFloat("FOV", &fov_degrees, 30.0f, 120.0f);
+	} else {
+		ImGui::SliderFloat("Size", &ortho_size, 2.0f, 20.0f);
+	}
+
+	ImGui::End();
 
 	// Модель: фигура вращается со временем
 	const math::Matrix4 model = math::rotationY(float(time)) * math::rotationX(float(time) * 0.5f);
@@ -369,8 +386,16 @@ void update(double time) {
 	// Вид: камера смотрит вдоль +Z, поэтому отодвигаем всю сцену от камеры
 	const math::Matrix4 view = math::translation(0.0f, 0.0f, camera_distance);
 
-	const math::Matrix4 projection = math::perspective(math::radians(fov_degrees), aspect,
-	                                                   z_near, z_far);
+	// Доп. задание 1: выбор матрицы проекции
+	const VkExtent2D extent = graphics::internal::context.swapchain_extent;
+	const float aspect = float(extent.width) / float(extent.height);
+
+	math::Matrix4 projection;
+	if (projection_type == 0) {
+		projection = math::perspective(math::radians(fov_degrees), aspect, z_near, z_far);
+	} else {
+		projection = math::orthographic(ortho_size * aspect, ortho_size, z_near, z_far);
+	}
 
 	uniforms.matrix = projection * view * model;
 }
