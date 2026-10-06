@@ -15,6 +15,7 @@ namespace {
 
 struct Vertex {
 	float position[3];
+	float color[3];
 };
 
 // Данные для шейдеров. Раскладка должна совпадать с uniform-блоком
@@ -29,9 +30,10 @@ struct GlobalUniforms {
 // Правильный икосаэдр: 12 вершин и 20 граней (правильных треугольников).
 // Его вершины — это углы трёх взаимно перпендикулярных "золотых" прямоугольников
 // со сторонами 2 и 2 * phi, где phi — золотое сечение.
+// Цвета вершин здесь не заданы, они считаются в createBuffers().
 const float phi = (1.0f + std::sqrt(5.0f)) / 2.0f;
 
-const Vertex vertices[] = {
+Vertex vertices[] = {
 	{ { -1.0f,  phi,  0.0f } },
 	{ {  1.0f,  phi,  0.0f } },
 	{ { -1.0f, -phi,  0.0f } },
@@ -85,7 +87,7 @@ float animation_time = 0.0f; // собственное время анимаци
 double last_time = 0.0;
 
 // Доп. задание 4: цвет фигуры
-float color[3] = { 1.0f, 0.6f, 0.2f };
+float color[3] = { 1.0f, 1.0f, 1.0f };
 
 graphics::Buffer vertex_buffer;
 graphics::Buffer index_buffer;
@@ -102,6 +104,16 @@ VkPipeline vk_pipeline;
 GlobalUniforms uniforms;
 
 bool createBuffers() {
+	// Доп. задание 5: цвет вершины зависит от её позиции в локальной системе координат.
+	// Каждая координата переводится из [-radius, radius] в [0, 1] и становится R, G или B.
+	const float radius = std::sqrt(1.0f + phi * phi); // расстояние от центра до вершины
+
+	for (Vertex& vertex : vertices) {
+		for (int i = 0; i < 3; ++i) {
+			vertex.color[i] = vertex.position[i] / radius * 0.5f + 0.5f;
+		}
+	}
+
 	if (!graphics::createBuffer(sizeof(vertices), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertex_buffer)) {
 		return false;
 	}
@@ -243,13 +255,19 @@ bool createPipeline() {
 		},
 	};
 
-	// Атрибут location = 0 в шейдере — это позиция, три float
+	// Атрибуты вершины: location = 0 — позиция, location = 1 — цвет, оба по три float
 	const VkVertexInputAttributeDescription vertex_attributes[] = {
 		{
 			.location = 0,
 			.binding = 0,
 			.format = VK_FORMAT_R32G32B32_SFLOAT,
 			.offset = offsetof(Vertex, position),
+		},
+		{
+			.location = 1,
+			.binding = 0,
+			.format = VK_FORMAT_R32G32B32_SFLOAT,
+			.offset = offsetof(Vertex, color),
 		},
 	};
 
