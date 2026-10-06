@@ -33,7 +33,8 @@ FetchContent_Declare(
 FetchContent_Declare(
 	vk-bootstrap
 	GIT_REPOSITORY https://github.com/charles-lunarg/vk-bootstrap.git
-	GIT_TAG v1.4.321
+	# Версия совпадает с установленным Vulkan SDK 1.4.313 (v1.4.321 не собирается со старыми заголовками)
+	GIT_TAG v1.4.313
 )
 
 FetchContent_Declare(
