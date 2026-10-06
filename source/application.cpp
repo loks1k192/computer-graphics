@@ -73,6 +73,14 @@ float position[3] = { 0.0f, 0.0f, 0.0f };
 float rotation[3] = { 0.0f, 0.0f, 0.0f };
 float scale[3] = { 1.0f, 1.0f, 1.0f };
 
+// Доп. задание 3: анимация движения по траектории
+bool animation_playing = true;
+float animation_speed = 1.0f;
+float trajectory_radius = 1.5f;
+float trajectory_height = 0.5f;
+float animation_time = 0.0f; // собственное время анимации, на паузе не идёт
+double last_time = 0.0;
+
 graphics::Buffer vertex_buffer;
 graphics::Buffer index_buffer;
 graphics::Buffer uniform_buffer;
@@ -371,6 +379,10 @@ void shutdown() {
 }
 
 void update(double time) {
+	// Время, прошедшее с прошлого кадра
+	const float delta_time = float(time - last_time);
+	last_time = time;
+
 	ImGui::Begin("Icosahedron");
 
 	ImGui::SeparatorText("Projection");
@@ -388,15 +400,33 @@ void update(double time) {
 	ImGui::SliderFloat3("Rotation", rotation, -180.0f, 180.0f);
 	ImGui::SliderFloat3("Scale", scale, 0.1f, 3.0f);
 
+	ImGui::SeparatorText("Animation");
+	if (ImGui::Button(animation_playing ? "Pause" : "Play")) {
+		animation_playing = !animation_playing;
+	}
+	ImGui::SliderFloat("Speed", &animation_speed, 0.0f, 5.0f);
+	ImGui::SliderFloat("Radius", &trajectory_radius, 0.0f, 3.0f);
+	ImGui::SliderFloat("Wave height", &trajectory_height, 0.0f, 2.0f);
+
 	ImGui::End();
 
-	// Фигура вращается со временем вокруг своих осей Y и X
-	const float t = float(time);
+	// Доп. задание 3: время анимации идёт, только когда она не на паузе
+	if (animation_playing) {
+		animation_time += delta_time * animation_speed;
+	}
+
+	// Траектория: окружность радиуса trajectory_radius в плоскости XZ,
+	// вдоль которой фигура ещё и колеблется по Y (3 волны за один оборот).
+	// Во время движения фигура вращается вокруг своих осей Y и X.
+	const float t = animation_time;
+	const float offset_x = trajectory_radius * std::cos(t);
+	const float offset_y = trajectory_height * std::sin(3.0f * t);
+	const float offset_z = trajectory_radius * std::sin(t);
 
 	// Модель: сначала растяжение, потом поворот, потом перемещение
 	// (матрицы применяются к вершине справа налево)
 	const math::Matrix4 model =
-		math::translation(position[0], position[1], position[2]) *
+		math::translation(position[0] + offset_x, position[1] + offset_y, position[2] + offset_z) *
 		math::rotationZ(math::radians(rotation[2])) *
 		math::rotationY(math::radians(rotation[1]) + t) *
 		math::rotationX(math::radians(rotation[0]) + t * 0.5f) *
