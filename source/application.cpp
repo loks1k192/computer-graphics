@@ -68,6 +68,11 @@ int projection_type = 0;
 float fov_degrees = 60.0f; // вертикальный угол обзора перспективной проекции
 float ortho_size = 7.0f;   // высота видимой области ортографической проекции
 
+// Доп. задание 2: позиция, поворот (в градусах) и растяжение фигуры
+float position[3] = { 0.0f, 0.0f, 0.0f };
+float rotation[3] = { 0.0f, 0.0f, 0.0f };
+float scale[3] = { 1.0f, 1.0f, 1.0f };
+
 graphics::Buffer vertex_buffer;
 graphics::Buffer index_buffer;
 graphics::Buffer uniform_buffer;
@@ -378,10 +383,24 @@ void update(double time) {
 		ImGui::SliderFloat("Size", &ortho_size, 2.0f, 20.0f);
 	}
 
+	ImGui::SeparatorText("Transform");
+	ImGui::SliderFloat3("Position", position, -3.0f, 3.0f);
+	ImGui::SliderFloat3("Rotation", rotation, -180.0f, 180.0f);
+	ImGui::SliderFloat3("Scale", scale, 0.1f, 3.0f);
+
 	ImGui::End();
 
-	// Модель: фигура вращается со временем
-	const math::Matrix4 model = math::rotationY(float(time)) * math::rotationX(float(time) * 0.5f);
+	// Фигура вращается со временем вокруг своих осей Y и X
+	const float t = float(time);
+
+	// Модель: сначала растяжение, потом поворот, потом перемещение
+	// (матрицы применяются к вершине справа налево)
+	const math::Matrix4 model =
+		math::translation(position[0], position[1], position[2]) *
+		math::rotationZ(math::radians(rotation[2])) *
+		math::rotationY(math::radians(rotation[1]) + t) *
+		math::rotationX(math::radians(rotation[0]) + t * 0.5f) *
+		math::scale(scale[0], scale[1], scale[2]);
 
 	// Вид: камера смотрит вдоль +Z, поэтому отодвигаем всю сцену от камеры
 	const math::Matrix4 view = math::translation(0.0f, 0.0f, camera_distance);
