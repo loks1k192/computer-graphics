@@ -18,11 +18,11 @@ struct Vertex {
 	float color[3];
 };
 
-// Данные для шейдеров. Раскладка должна совпадать с uniform-блоком
-// GlobalUniforms в shaders/basic.vert по правилам std140: mat4 занимает
+// Данные одного объекта для шейдеров. Раскладка должна совпадать с uniform-блоком
+// ObjectUniforms в shaders/basic.vert по правилам std140: mat4 занимает
 // байты 0..63, vec4 — байты 64..79, поэтому выравнивающие байты не нужны.
 // Для цвета взят vec4, а не vec3, чтобы не думать о выравнивании vec3 в std140.
-struct GlobalUniforms {
+struct ObjectUniforms {
 	math::Matrix4 matrix; // projection * view * model
 	float color[4];
 };
@@ -73,35 +73,51 @@ int projection_type = 0;
 float fov_degrees = 60.0f; // вертикальный угол обзора перспективной проекции
 float ortho_size = 7.0f;   // высота видимой области ортографической проекции
 
-// Доп. задание 2: позиция, поворот (в градусах) и растяжение фигуры
-float position[3] = { 0.0f, 0.0f, 0.0f };
-float rotation[3] = { 0.0f, 0.0f, 0.0f };
-float scale[3] = { 1.0f, 1.0f, 1.0f };
-
 // Доп. задание 3: анимация движения по траектории
 bool animation_playing = true;
 float animation_speed = 1.0f;
-float trajectory_radius = 1.5f;
+float trajectory_radius = 2.5f;
 float trajectory_height = 0.5f;
 float animation_time = 0.0f; // собственное время анимации, на паузе не идёт
 double last_time = 0.0;
 
-// Доп. задание 4: цвет фигуры
-float color[3] = { 1.0f, 1.0f, 1.0f };
+// Доп. задание 6: на сцене несколько икосаэдров. Все они рисуются из одних и тех же
+// вершинного и индексного буферов, но у каждого объекта свои параметры, свой
+// uniform-буфер (матрица и цвет) и свой набор дескрипторов, который на него указывает.
+// Один общий uniform-буфер не подойдёт: GPU выполнит команды позже, уже после их записи,
+// и все объекты нарисовались бы с данными, которые были записаны в буфер последними.
+struct Object {
+	// Доп. задание 2: позиция, поворот (в градусах) и растяжение
+	float position[3];
+	float rotation[3];
+	float scale[3];
+
+	// Доп. задание 4: цвет
+	float color[3];
+
+	ObjectUniforms uniforms; // считаются в update(), копируются на GPU в render()
+	graphics::Buffer uniform_buffer;
+	VkDescriptorSet descriptor_set;
+};
+
+constexpr int object_count = 3;
+
+Object objects[object_count] = {
+	{ .scale = { 0.6f, 0.6f, 0.6f }, .color = { 1.0f, 1.0f, 1.0f } },
+	{ .scale = { 0.6f, 0.6f, 0.6f }, .color = { 1.0f, 0.4f, 0.4f } },
+	{ .scale = { 0.6f, 0.6f, 0.6f }, .color = { 0.4f, 0.6f, 1.0f } },
+};
+
+int selected_object = 0; // объект, параметры которого сейчас меняются в интерфейсе
 
 graphics::Buffer vertex_buffer;
 graphics::Buffer index_buffer;
-graphics::Buffer uniform_buffer;
 
 VkDescriptorSetLayout vk_descriptor_set_layout;
 VkDescriptorPool vk_descriptor_pool;
-VkDescriptorSet vk_descriptor_set;
 
 VkPipelineLayout vk_pipeline_layout;
 VkPipeline vk_pipeline;
-
-// Значения uniform-буфера на CPU: считаются в update(), копируются на GPU в render()
-GlobalUniforms uniforms;
 
 bool createBuffers() {
 	// Доп. задание 5: цвет вершины зависит от её позиции в локальной системе координат.
@@ -124,15 +140,22 @@ bool createBuffers() {
 	}
 	memcpy(index_buffer.memory, indices, sizeof(indices));
 
-	// Uniform-буфер заполняется каждый кадр
-	return graphics::createBuffer(sizeof(GlobalUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-	                              uniform_buffer);
+	// Доп. задание 6: у каждого объекта свой uniform-буфер, он заполняется каждый кадр
+	for (Object& object : objects) {
+		if (!graphics::createBuffer(sizeof(ObjectUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+		                            object.uniform_buffer)) {
+			return false;
+		}
+	}
+
+	return true;
 }
 
-bool createDescriptorSet() {
+bool createDescriptorSets() {
 	auto& context = graphics::internal::context;
 
-	// В наборе один дескриптор: uniform-буфер в binding = 0, его читает вершинный шейдер
+	// В наборе один дескриптор: uniform-буфер в binding = 0, его читает вершинный шейдер.
+	// Наборы всех объектов устроены одинаково, поэтому описание (layout) у них одно.
 	const VkDescriptorSetLayoutBinding descriptor_set_bindings[] = {
 		{
 			.binding = 0,
@@ -154,17 +177,18 @@ bool createDescriptorSet() {
 		return false;
 	}
 
-	// Из пула выделяется один набор, в котором один uniform-буфер
+	// Доп. задание 6: из пула выделяется object_count наборов, в каждом один uniform-буфер,
+	// поэтому всего в пуле нужно object_count * 1 дескрипторов типа UNIFORM_BUFFER
 	const VkDescriptorPoolSize descriptor_pool_sizes[] = {
 		{
 			.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-			.descriptorCount = 1,
+			.descriptorCount = object_count,
 		},
 	};
 
 	const VkDescriptorPoolCreateInfo descriptor_pool = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-		.maxSets = 1,
+		.maxSets = object_count,
 		.poolSizeCount = sizeof(descriptor_pool_sizes) / sizeof(descriptor_pool_sizes[0]),
 		.pPoolSizes = descriptor_pool_sizes,
 	};
@@ -175,39 +199,42 @@ bool createDescriptorSet() {
 		return false;
 	}
 
-	const VkDescriptorSetAllocateInfo descriptor_set = {
-		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-		.descriptorPool = vk_descriptor_pool,
-		.descriptorSetCount = 1,
-		.pSetLayouts = &vk_descriptor_set_layout,
-	};
+	// Каждому объекту — свой набор, который указывает на uniform-буфер этого объекта
+	for (Object& object : objects) {
+		const VkDescriptorSetAllocateInfo descriptor_set = {
+			.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+			.descriptorPool = vk_descriptor_pool,
+			.descriptorSetCount = 1,
+			.pSetLayouts = &vk_descriptor_set_layout,
+		};
 
-	if (vkAllocateDescriptorSets(context.device, &descriptor_set,
-	                             &vk_descriptor_set) != VK_SUCCESS) {
-		std::cerr << "Failed to allocate descriptor set\n";
-		return false;
+		if (vkAllocateDescriptorSets(context.device, &descriptor_set,
+		                             &object.descriptor_set) != VK_SUCCESS) {
+			std::cerr << "Failed to allocate descriptor set\n";
+			return false;
+		}
+
+		// Связываем uniform-буфер объекта с binding = 0 его набора
+		const VkDescriptorBufferInfo uniform_buffer_descriptor = {
+			.buffer = object.uniform_buffer.buffer,
+			.offset = 0,
+			.range = sizeof(ObjectUniforms),
+		};
+
+		const VkWriteDescriptorSet descriptor_writes[] = {
+			{
+				.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+				.dstSet = object.descriptor_set,
+				.dstBinding = 0,
+				.descriptorCount = 1,
+				.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+				.pBufferInfo = &uniform_buffer_descriptor,
+			},
+		};
+
+		vkUpdateDescriptorSets(context.device, sizeof(descriptor_writes) / sizeof(descriptor_writes[0]),
+		                       descriptor_writes, 0, nullptr);
 	}
-
-	// Связываем uniform-буфер с binding = 0 выделенного набора
-	const VkDescriptorBufferInfo uniform_buffer_descriptor = {
-		.buffer = uniform_buffer.buffer,
-		.offset = 0,
-		.range = sizeof(GlobalUniforms),
-	};
-
-	const VkWriteDescriptorSet descriptor_writes[] = {
-		{
-			.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-			.dstSet = vk_descriptor_set,
-			.dstBinding = 0,
-			.descriptorCount = 1,
-			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-			.pBufferInfo = &uniform_buffer_descriptor,
-		},
-	};
-
-	vkUpdateDescriptorSets(context.device, sizeof(descriptor_writes) / sizeof(descriptor_writes[0]),
-	                       descriptor_writes, 0, nullptr);
 
 	return true;
 }
@@ -375,7 +402,7 @@ bool initialize() {
 		return false;
 	}
 
-	if (!createDescriptorSet()) {
+	if (!createDescriptorSets()) {
 		return false;
 	}
 
@@ -397,7 +424,9 @@ void shutdown() {
 	vkDestroyDescriptorPool(context.device, vk_descriptor_pool, nullptr);
 	vkDestroyDescriptorSetLayout(context.device, vk_descriptor_set_layout, nullptr);
 
-	graphics::destroyBuffer(uniform_buffer);
+	for (const Object& object : objects) {
+		graphics::destroyBuffer(object.uniform_buffer);
+	}
 	graphics::destroyBuffer(index_buffer);
 	graphics::destroyBuffer(vertex_buffer);
 }
@@ -419,21 +448,23 @@ void update(double time) {
 		ImGui::SliderFloat("Size", &ortho_size, 2.0f, 20.0f);
 	}
 
-	ImGui::SeparatorText("Transform");
-	ImGui::SliderFloat3("Position", position, -3.0f, 3.0f);
-	ImGui::SliderFloat3("Rotation", rotation, -180.0f, 180.0f);
-	ImGui::SliderFloat3("Scale", scale, 0.1f, 3.0f);
-
 	ImGui::SeparatorText("Animation");
 	if (ImGui::Button(animation_playing ? "Pause" : "Play")) {
 		animation_playing = !animation_playing;
 	}
 	ImGui::SliderFloat("Speed", &animation_speed, 0.0f, 5.0f);
-	ImGui::SliderFloat("Radius", &trajectory_radius, 0.0f, 3.0f);
+	ImGui::SliderFloat("Radius", &trajectory_radius, 0.0f, 5.0f);
 	ImGui::SliderFloat("Wave height", &trajectory_height, 0.0f, 2.0f);
 
-	ImGui::SeparatorText("Color");
-	ImGui::ColorEdit3("Color", color);
+	// Доп. задание 6: сначала выбираем объект, потом меняем его параметры
+	ImGui::SeparatorText("Object");
+	ImGui::SliderInt("Selected", &selected_object, 0, object_count - 1);
+
+	Object& selected = objects[selected_object];
+	ImGui::SliderFloat3("Position", selected.position, -3.0f, 3.0f);
+	ImGui::SliderFloat3("Rotation", selected.rotation, -180.0f, 180.0f);
+	ImGui::SliderFloat3("Scale", selected.scale, 0.1f, 3.0f);
+	ImGui::ColorEdit3("Color", selected.color);
 
 	ImGui::End();
 
@@ -441,23 +472,6 @@ void update(double time) {
 	if (animation_playing) {
 		animation_time += delta_time * animation_speed;
 	}
-
-	// Траектория: окружность радиуса trajectory_radius в плоскости XZ,
-	// вдоль которой фигура ещё и колеблется по Y (3 волны за один оборот).
-	// Во время движения фигура вращается вокруг своих осей Y и X.
-	const float t = animation_time;
-	const float offset_x = trajectory_radius * std::cos(t);
-	const float offset_y = trajectory_height * std::sin(3.0f * t);
-	const float offset_z = trajectory_radius * std::sin(t);
-
-	// Модель: сначала растяжение, потом поворот, потом перемещение
-	// (матрицы применяются к вершине справа налево)
-	const math::Matrix4 model =
-		math::translation(position[0] + offset_x, position[1] + offset_y, position[2] + offset_z) *
-		math::rotationZ(math::radians(rotation[2])) *
-		math::rotationY(math::radians(rotation[1]) + t) *
-		math::rotationX(math::radians(rotation[0]) + t * 0.5f) *
-		math::scale(scale[0], scale[1], scale[2]);
 
 	// Вид: камера смотрит вдоль +Z, поэтому отодвигаем всю сцену от камеры
 	const math::Matrix4 view = math::translation(0.0f, 0.0f, camera_distance);
@@ -473,21 +487,48 @@ void update(double time) {
 		projection = math::orthographic(ortho_size * aspect, ortho_size, z_near, z_far);
 	}
 
-	uniforms.matrix = projection * view * model;
+	// Вид и проекция общие для всей сцены, а матрица модели и цвет у каждого объекта свои
+	for (int i = 0; i < object_count; ++i) {
+		Object& object = objects[i];
 
-	// Доп. задание 4: цвет из интерфейса уходит в шейдер через uniform-буфер
-	uniforms.color[0] = color[0];
-	uniforms.color[1] = color[1];
-	uniforms.color[2] = color[2];
-	uniforms.color[3] = 1.0f;
+		// Траектория: окружность радиуса trajectory_radius в плоскости XZ,
+		// вдоль которой фигура ещё и колеблется по Y (3 волны за один оборот).
+		// Во время движения фигура вращается вокруг своих осей Y и X.
+		// Объекты сдвинуты по фазе на 2 * pi / object_count, поэтому идут
+		// по окружности на одинаковом расстоянии друг от друга.
+		const float t = animation_time + 2.0f * math::pi * float(i) / float(object_count);
+		const float offset_x = trajectory_radius * std::cos(t);
+		const float offset_y = trajectory_height * std::sin(3.0f * t);
+		const float offset_z = trajectory_radius * std::sin(t);
+
+		// Модель: сначала растяжение, потом поворот, потом перемещение
+		// (матрицы применяются к вершине справа налево)
+		const math::Matrix4 model =
+			math::translation(object.position[0] + offset_x, object.position[1] + offset_y,
+			                  object.position[2] + offset_z) *
+			math::rotationZ(math::radians(object.rotation[2])) *
+			math::rotationY(math::radians(object.rotation[1]) + t) *
+			math::rotationX(math::radians(object.rotation[0]) + t * 0.5f) *
+			math::scale(object.scale[0], object.scale[1], object.scale[2]);
+
+		object.uniforms.matrix = projection * view * model;
+
+		// Доп. задание 4: цвет из интерфейса уходит в шейдер через uniform-буфер
+		object.uniforms.color[0] = object.color[0];
+		object.uniforms.color[1] = object.color[1];
+		object.uniforms.color[2] = object.color[2];
+		object.uniforms.color[3] = 1.0f;
+	}
 }
 
 void render(const graphics::internal::FrameData& fd) {
 	auto& context = graphics::internal::context;
 
 	// Копируем данные именно здесь: prepare() уже дождался, пока GPU закончит
-	// предыдущий кадр, поэтому uniform-буфер сейчас никто не читает
-	memcpy(uniform_buffer.memory, &uniforms, sizeof(uniforms));
+	// предыдущий кадр, поэтому uniform-буферы сейчас никто не читает
+	for (const Object& object : objects) {
+		memcpy(object.uniform_buffer.memory, &object.uniforms, sizeof(object.uniforms));
+	}
 
 	vkResetCommandBuffer(fd.command_buffer, 0);
 
@@ -535,10 +576,15 @@ void render(const graphics::internal::FrameData& fd) {
 	vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &vertex_buffer.buffer, &vertex_buffer_offset);
 	vkCmdBindIndexBuffer(fd.command_buffer, index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
 
-	vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_layout,
-	                        0, 1, &vk_descriptor_set, 0, nullptr);
+	// Доп. задание 6: все объекты рисуются из одних и тех же вершин и индексов, но перед
+	// каждой отрисовкой привязывается набор дескрипторов объекта, поэтому вершинный шейдер
+	// получает матрицу и цвет именно этого объекта
+	for (const Object& object : objects) {
+		vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_layout,
+		                        0, 1, &object.descriptor_set, 0, nullptr);
 
-	vkCmdDrawIndexed(fd.command_buffer, index_count, 1, 0, 0, 0);
+		vkCmdDrawIndexed(fd.command_buffer, index_count, 1, 0, 0, 0);
+	}
 
 	vkCmdEndRenderPass(fd.command_buffer);
 

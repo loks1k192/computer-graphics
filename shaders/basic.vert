@@ -5,14 +5,15 @@ layout(location = 1) in vec3 in_color;
 
 layout(location = 0) out vec3 out_color;
 
-layout(std140, set = 0, binding = 0) uniform GlobalUniforms {
+// Данные текущего объекта: берутся из набора дескрипторов, привязанного перед отрисовкой
+layout(std140, set = 0, binding = 0) uniform ObjectUniforms {
 	mat4 matrix; // projection * view * model
-	vec4 color;  // цвет фигуры из интерфейса
-} global_uniforms;
+	vec4 color;  // цвет объекта из интерфейса
+} object_uniforms;
 
 void main() {
-	gl_Position = global_uniforms.matrix * vec4(in_position, 1);
+	gl_Position = object_uniforms.matrix * vec4(in_position, 1);
 
 	// Цвет вершины умножается на цвет, выбранный в интерфейсе
-	out_color = in_color * global_uniforms.color.rgb;
+	out_color = in_color * object_uniforms.color.rgb;
 }

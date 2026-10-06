@@ -29,8 +29,10 @@ inline Matrix4 operator*(const Matrix4& a, const Matrix4& b) {
 	return result;
 }
 
+constexpr float pi = std::numbers::pi_v<float>;
+
 inline float radians(float degrees) {
-	return degrees * std::numbers::pi_v<float> / 180.0f;
+	return degrees * pi / 180.0f;
 }
 
 inline Matrix4 identity() {
