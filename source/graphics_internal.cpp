@@ -786,7 +786,7 @@ void submitAndPresent() {
 	    result == VK_SUBOPTIMAL_KHR ||
 	    vk_swapchain_resize_require) {
 		rebuildSwapchain(vk_swapchain_resize_width, vk_swapchain_resize_height);
-	} else {
+	} else if (result != VK_SUCCESS) {
 		std::cerr << "Failed to present Vulkan swapchain image\n";
 	}
 }
