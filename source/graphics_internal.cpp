@@ -461,9 +461,18 @@ bool initialize(GLFWwindow* const window) {
 		return false;
 	}
 
+	// Под Wayland поверхность окна не сообщает свой размер (currentExtent = UINT32_MAX),
+	// поэтому размер swapchain нужно передать явно, иначе vk-bootstrap возьмёт 256x256
+	int framebuffer_width = 0;
+	int framebuffer_height = 0;
+	glfwGetFramebufferSize(window, &framebuffer_width, &framebuffer_height);
+	vk_swapchain_resize_width = uint32_t(framebuffer_width);
+	vk_swapchain_resize_height = uint32_t(framebuffer_height);
+
 	vkb::SwapchainBuilder sb(vkb_device);
 
-	auto sb_result = sb.use_default_format_selection()
+	auto sb_result = sb.set_desired_extent(vk_swapchain_resize_width, vk_swapchain_resize_height)
+					   .use_default_format_selection()
 					   .set_desired_present_mode(VK_PRESENT_MODE_FIFO_KHR)
 					   .use_default_image_usage_flags()
 					   .build();
