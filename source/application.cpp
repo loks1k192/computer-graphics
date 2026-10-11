@@ -116,6 +116,13 @@ struct SpotLight {
 	float outer_angle;
 };
 
+// Доп. задание 4: матрица и цвет фигуры-визуализации источника. Передаются push-константами
+// прямо в командный буфер перед каждой отрисовкой, потому что число источников всё время меняется.
+struct LightMarkerConstants {
+	math::Matrix4 model; // 0
+	float color[4];      // 64
+};
+
 // Геометрия в памяти видеокарты: вершины и индексы одной фигуры
 struct Mesh {
 	graphics::Buffer vertex_buffer;
@@ -125,6 +132,7 @@ struct Mesh {
 
 Mesh icosahedron_mesh;
 Mesh floor_mesh;
+Mesh cube_mesh;
 
 constexpr float z_near = 0.1f;
 constexpr float z_far = 100.0f;
@@ -210,12 +218,22 @@ uint32_t point_light_capacity = 4;
 graphics::Buffer spot_light_buffer;
 uint32_t spot_light_capacity = 4;
 
+// Доп. задание 4: конусы прожекторов рисуются линиями, вершины пересчитываются каждый кадр
+bool show_light_sources = true;
+std::vector<Vertex> cone_vertices;
+graphics::Buffer cone_vertex_buffer;
+uint32_t cone_vertex_capacity = 256;
+
 VkDescriptorSetLayout vk_scene_set_layout;
 VkDescriptorSetLayout vk_model_set_layout;
 VkDescriptorPool vk_descriptor_pool;
 
 VkPipelineLayout vk_pipeline_layout;
 VkPipeline vk_pipeline;
+
+VkPipelineLayout vk_light_pipeline_layout;
+VkPipeline vk_light_pipeline; // кубы источников
+VkPipeline vk_line_pipeline;  // конусы прожекторов
 
 bool createMesh(const Vertex vertices[], uint32_t vertex_count,
                 const uint32_t indices[], uint32_t index_count, Mesh& mesh) {
@@ -280,6 +298,32 @@ bool createBuffers() {
 	const uint32_t floor_indices[] = { 0, 1, 2, 0, 2, 3 };
 
 	if (!createMesh(floor_vertices, 4, floor_indices, 6, floor_mesh)) {
+		return false;
+	}
+
+	// Доп. задание 4: куб для визуализации источников. Он не освещается, поэтому нормали не нужны.
+	const Vertex cube_vertices[] = {
+		{ { -1.0f, -1.0f, -1.0f } }, { {  1.0f, -1.0f, -1.0f } },
+		{ {  1.0f,  1.0f, -1.0f } }, { { -1.0f,  1.0f, -1.0f } },
+		{ { -1.0f, -1.0f,  1.0f } }, { {  1.0f, -1.0f,  1.0f } },
+		{ {  1.0f,  1.0f,  1.0f } }, { { -1.0f,  1.0f,  1.0f } },
+	};
+
+	const uint32_t cube_indices[] = {
+		0, 1, 2,  0, 2, 3,
+		4, 6, 5,  4, 7, 6,
+		0, 4, 5,  0, 5, 1,
+		3, 2, 6,  3, 6, 7,
+		0, 3, 7,  0, 7, 4,
+		1, 5, 6,  1, 6, 2,
+	};
+
+	if (!createMesh(cube_vertices, 8, cube_indices, 36, cube_mesh)) {
+		return false;
+	}
+
+	if (!graphics::createBuffer(cone_vertex_capacity * sizeof(Vertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+	                            cone_vertex_buffer)) {
 		return false;
 	}
 
@@ -507,29 +551,15 @@ bool createDescriptorSets() {
 	return true;
 }
 
-bool createPipeline() {
+// Доп. задание 4: конвейеров теперь три. Они отличаются шейдерами, pipeline layout,
+// топологией (треугольники или линии) и отбрасыванием граней, остальное у них общее.
+bool createPipeline(const char vertex_shader_path[], const char fragment_shader_path[],
+                    VkPipelineLayout layout, VkPrimitiveTopology topology,
+                    VkCullModeFlags cull_mode, VkPipeline& result) {
 	auto& context = graphics::internal::context;
 
-	// Номер описания в массиве — это номер set в шейдере
-	const VkDescriptorSetLayout set_layouts[] = {
-		vk_scene_set_layout,
-		vk_model_set_layout,
-	};
-
-	const VkPipelineLayoutCreateInfo pipeline_layout = {
-		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-		.setLayoutCount = sizeof(set_layouts) / sizeof(set_layouts[0]),
-		.pSetLayouts = set_layouts,
-	};
-
-	if (vkCreatePipelineLayout(context.device, &pipeline_layout, nullptr,
-	                           &vk_pipeline_layout) != VK_SUCCESS) {
-		std::cerr << "Failed to create pipeline layout\n";
-		return false;
-	}
-
-	VkShaderModule vertex_shader = graphics::loadShaderModule("shaders/basic.vert.spv");
-	VkShaderModule fragment_shader = graphics::loadShaderModule("shaders/basic.frag.spv");
+	VkShaderModule vertex_shader = graphics::loadShaderModule(vertex_shader_path);
+	VkShaderModule fragment_shader = graphics::loadShaderModule(fragment_shader_path);
 
 	const VkPipelineShaderStageCreateInfo stages[] = {
 		{
@@ -579,7 +609,7 @@ bool createPipeline() {
 
 	const VkPipelineInputAssemblyStateCreateInfo input_assembly_state = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-		.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+		.topology = topology,
 	};
 
 	const VkPipelineViewportStateCreateInfo viewport_state = {
@@ -591,7 +621,7 @@ bool createPipeline() {
 	const VkPipelineRasterizationStateCreateInfo rasterization_state = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
 		.polygonMode = VK_POLYGON_MODE_FILL,
-		.cullMode = VK_CULL_MODE_BACK_BIT,
+		.cullMode = cull_mode,
 		.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
 		.lineWidth = 1.0f,
 	};
@@ -642,23 +672,92 @@ bool createPipeline() {
 		.pDepthStencilState = &depth_stencil_state,
 		.pColorBlendState = &color_blend_state,
 		.pDynamicState = &dynamic_state,
-		.layout = vk_pipeline_layout,
+		.layout = layout,
 		.renderPass = context.render_pass,
 		.subpass = 0,
 	};
 
-	const VkResult result = vkCreateGraphicsPipelines(context.device, VK_NULL_HANDLE, 1, &pipeline,
-	                                                  nullptr, &vk_pipeline);
+	const VkResult status = vkCreateGraphicsPipelines(context.device, VK_NULL_HANDLE, 1, &pipeline,
+	                                                  nullptr, &result);
 
 	vkDestroyShaderModule(context.device, vertex_shader, nullptr);
 	vkDestroyShaderModule(context.device, fragment_shader, nullptr);
 
-	if (result != VK_SUCCESS) {
+	if (status != VK_SUCCESS) {
 		std::cerr << "Failed to create graphics pipeline\n";
 		return false;
 	}
 
 	return true;
+}
+
+bool createPipelines() {
+	auto& context = graphics::internal::context;
+
+	// Номер описания в массиве — это номер set в шейдере
+	const VkDescriptorSetLayout set_layouts[] = {
+		vk_scene_set_layout,
+		vk_model_set_layout,
+	};
+
+	const VkPipelineLayoutCreateInfo pipeline_layout = {
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+		.setLayoutCount = sizeof(set_layouts) / sizeof(set_layouts[0]),
+		.pSetLayouts = set_layouts,
+	};
+
+	if (vkCreatePipelineLayout(context.device, &pipeline_layout, nullptr,
+	                           &vk_pipeline_layout) != VK_SUCCESS) {
+		std::cerr << "Failed to create pipeline layout\n";
+		return false;
+	}
+
+	// Доп. задание 4: визуализации источников нужен только set = 0 (view_projection),
+	// а матрица и цвет фигуры приходят в push-константах
+	const VkPushConstantRange push_constant_range = {
+		.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+		.offset = 0,
+		.size = sizeof(LightMarkerConstants),
+	};
+
+	const VkPipelineLayoutCreateInfo light_pipeline_layout = {
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+		.setLayoutCount = 1,
+		.pSetLayouts = &vk_scene_set_layout,
+		.pushConstantRangeCount = 1,
+		.pPushConstantRanges = &push_constant_range,
+	};
+
+	if (vkCreatePipelineLayout(context.device, &light_pipeline_layout, nullptr,
+	                           &vk_light_pipeline_layout) != VK_SUCCESS) {
+		std::cerr << "Failed to create light pipeline layout\n";
+		return false;
+	}
+
+	if (!createPipeline("shaders/basic.vert.spv", "shaders/basic.frag.spv", vk_pipeline_layout,
+	                    VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_CULL_MODE_BACK_BIT, vk_pipeline)) {
+		return false;
+	}
+
+	if (!createPipeline("shaders/light.vert.spv", "shaders/light.frag.spv", vk_light_pipeline_layout,
+	                    VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_CULL_MODE_NONE, vk_light_pipeline)) {
+		return false;
+	}
+
+	if (!createPipeline("shaders/light.vert.spv", "shaders/light.frag.spv", vk_light_pipeline_layout,
+	                    VK_PRIMITIVE_TOPOLOGY_LINE_LIST, VK_CULL_MODE_NONE, vk_line_pipeline)) {
+		return false;
+	}
+
+	return true;
+}
+
+// Нормирует направление источника. Нулевой вектор из интерфейса заменяется направлением вниз.
+math::Vector3 normalizeDirection(math::Vector3 direction) {
+	if (math::length(direction) < 0.001f) {
+		return { 0.0f, 1.0f, 0.0f };
+	}
+	return math::normalize(direction);
 }
 
 // Движение камеры с клавиатуры: WASD — вперёд/влево/назад/вправо, Q/E — вниз/вверх,
@@ -700,6 +799,18 @@ void moveCamera(float delta_time) {
 	camera_pitch = std::fmin(std::fmax(camera_pitch, -89.0f), 89.0f);
 }
 
+// Доп. задание 4: маленький куб цвета источника в его позиции
+void drawLightCube(VkCommandBuffer command_buffer, math::Vector3 position, math::Vector3 color) {
+	const LightMarkerConstants constants = {
+		.model = math::translation(position.x, position.y, position.z) * math::scale(0.15f, 0.15f, 0.15f),
+		.color = { color.x, color.y, color.z, 1.0f },
+	};
+
+	vkCmdPushConstants(command_buffer, vk_light_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+	                   sizeof(constants), &constants);
+	vkCmdDrawIndexed(command_buffer, cube_mesh.index_count, 1, 0, 0, 0);
+}
+
 } // namespace
 
 bool initialize() {
@@ -711,7 +822,7 @@ bool initialize() {
 		return false;
 	}
 
-	if (!createPipeline()) {
+	if (!createPipelines()) {
 		return false;
 	}
 
@@ -722,7 +833,10 @@ void shutdown() {
 	auto& context = graphics::internal::context;
 	vkQueueWaitIdle(context.graphics_queue);
 
+	vkDestroyPipeline(context.device, vk_line_pipeline, nullptr);
+	vkDestroyPipeline(context.device, vk_light_pipeline, nullptr);
 	vkDestroyPipeline(context.device, vk_pipeline, nullptr);
+	vkDestroyPipelineLayout(context.device, vk_light_pipeline_layout, nullptr);
 	vkDestroyPipelineLayout(context.device, vk_pipeline_layout, nullptr);
 
 	vkDestroyDescriptorPool(context.device, vk_descriptor_pool, nullptr);
@@ -732,9 +846,11 @@ void shutdown() {
 	for (const Object& object : objects) {
 		graphics::destroyBuffer(object.uniform_buffer);
 	}
+	graphics::destroyBuffer(cone_vertex_buffer);
 	graphics::destroyBuffer(spot_light_buffer);
 	graphics::destroyBuffer(point_light_buffer);
 	graphics::destroyBuffer(scene_uniform_buffer);
+	destroyMesh(cube_mesh);
 	destroyMesh(floor_mesh);
 	destroyMesh(icosahedron_mesh);
 }
@@ -774,6 +890,9 @@ void update(double time) {
 		ImGui::ColorEdit3("Color##ambient", &ambient_light_color.x);
 		ImGui::SliderFloat("Intensity##ambient", &ambient_light_intensity, 0.0f, 1.0f);
 	}
+
+	// Доп. задание 4: показать или скрыть фигуры источников
+	ImGui::Checkbox("Show light sources", &show_light_sources);
 
 	// Доп. задание 2: добавление, удаление и параметры точечных источников
 	if (ImGui::CollapsingHeader("Point lights", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -893,14 +1012,9 @@ void update(double time) {
 	}
 
 	// Направление света нормируем на CPU, чтобы не делать это для каждого пикселя
-	math::Vector3 light_direction = directional_light_direction;
-	if (math::length(light_direction) < 0.001f) {
-		light_direction = { 0.0f, 1.0f, 0.0f };
-	}
-
 	scene_uniforms.view_projection = projection * view;
 	scene_uniforms.camera_position = camera_position;
-	scene_uniforms.directional_light_direction = math::normalize(light_direction);
+	scene_uniforms.directional_light_direction = normalizeDirection(directional_light_direction);
 	scene_uniforms.directional_light_color = directional_light_color * directional_light_intensity;
 	scene_uniforms.ambient_light = ambient_light_color * ambient_light_intensity;
 	scene_uniforms.point_light_count = uint32_t(point_lights.size());
@@ -935,6 +1049,47 @@ void update(double time) {
 		object.uniforms.specular = object.specular;
 		object.uniforms.alpha = object.shininess;
 	}
+
+	// Доп. задание 4: конусы прожекторов из белых линий. Вершины считаются сразу в мировых
+	// координатах: ось конуса, 8 образующих и окружности внешнего и внутреннего углов.
+	cone_vertices.clear();
+
+	for (const SpotLight& light : spot_lights) {
+		const math::Vector3 direction = normalizeDirection(light.direction);
+
+		// Два вектора, перпендикулярных оси, задают плоскость окружности основания конуса
+		const math::Vector3 helper = std::fabs(direction.y) < 0.99f ? math::Vector3{ 0.0f, 1.0f, 0.0f }
+		                                                            : math::Vector3{ 1.0f, 0.0f, 0.0f };
+		const math::Vector3 side = math::normalize(math::cross(direction, helper));
+		const math::Vector3 up = math::cross(direction, side);
+
+		const float cone_length = 1.5f;
+		const math::Vector3 center = light.position + direction * cone_length;
+		const float outer_radius = cone_length * std::tan(math::radians(light.outer_angle));
+		const float inner_radius = cone_length * std::tan(math::radians(light.inner_angle));
+
+		cone_vertices.push_back({ light.position });
+		cone_vertices.push_back({ center });
+
+		const int segments = 16;
+		for (int k = 0; k < segments; ++k) {
+			const float angle0 = 2.0f * math::pi * float(k) / float(segments);
+			const float angle1 = 2.0f * math::pi * float(k + 1) / float(segments);
+			const math::Vector3 offset0 = side * std::cos(angle0) + up * std::sin(angle0);
+			const math::Vector3 offset1 = side * std::cos(angle1) + up * std::sin(angle1);
+
+			cone_vertices.push_back({ center + offset0 * outer_radius });
+			cone_vertices.push_back({ center + offset1 * outer_radius });
+
+			cone_vertices.push_back({ center + offset0 * inner_radius });
+			cone_vertices.push_back({ center + offset1 * inner_radius });
+
+			if (k % 2 == 0) {
+				cone_vertices.push_back({ light.position });
+				cone_vertices.push_back({ center + offset0 * outer_radius });
+			}
+		}
+	}
 }
 
 void render(const graphics::internal::FrameData& fd) {
@@ -967,16 +1122,18 @@ void render(const graphics::internal::FrameData& fd) {
 	for (size_t i = 0; i < spot_lights.size(); ++i) {
 		const SpotLight& light = spot_lights[i];
 
-		math::Vector3 direction = light.direction;
-		if (math::length(direction) < 0.001f) {
-			direction = { 0.0f, 1.0f, 0.0f };
-		}
-
 		spot_light_data[i].position = light.position;
 		spot_light_data[i].color = light.color * light.intensity;
-		spot_light_data[i].direction = math::normalize(direction);
+		spot_light_data[i].direction = normalizeDirection(light.direction);
 		spot_light_data[i].inner_cutoff = std::cos(math::radians(light.inner_angle));
 		spot_light_data[i].outer_cutoff = std::cos(math::radians(light.outer_angle));
+	}
+
+	// Доп. задание 4: вершины конусов, буфер растёт так же, как storage-буферы
+	if (!cone_vertices.empty()) {
+		growBuffer(cone_vertex_buffer, cone_vertex_capacity, cone_vertices.size(), sizeof(Vertex),
+		           VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+		memcpy(cone_vertex_buffer.memory, cone_vertices.data(), cone_vertices.size() * sizeof(Vertex));
 	}
 
 	for (const Object& object : objects) {
@@ -1039,6 +1196,44 @@ void render(const graphics::internal::FrameData& fd) {
 		                        1, 1, &object.descriptor_set, 0, nullptr);
 
 		vkCmdDrawIndexed(fd.command_buffer, object.mesh->index_count, 1, 0, 0, 0);
+	}
+
+	// Доп. задание 4: визуализация источников отдельным конвейером без освещения
+	if (show_light_sources) {
+		vkCmdBindPipeline(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_light_pipeline);
+
+		// У этого конвейера другой pipeline layout (с push-константами), поэтому
+		// набор сцены нужно привязать заново
+		vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_light_pipeline_layout,
+		                        0, 1, &scene_descriptor_set, 0, nullptr);
+
+		const VkDeviceSize vertex_buffer_offset = 0;
+		vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &cube_mesh.vertex_buffer.buffer, &vertex_buffer_offset);
+		vkCmdBindIndexBuffer(fd.command_buffer, cube_mesh.index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+
+		for (const PointLight& light : point_lights) {
+			drawLightCube(fd.command_buffer, light.position, light.color);
+		}
+
+		for (const SpotLight& light : spot_lights) {
+			drawLightCube(fd.command_buffer, light.position, light.color);
+		}
+
+		if (!cone_vertices.empty()) {
+			vkCmdBindPipeline(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_line_pipeline);
+
+			// Вершины конусов уже в мировых координатах, поэтому матрица модели единичная
+			const LightMarkerConstants constants = {
+				.model = math::identity(),
+				.color = { 1.0f, 1.0f, 1.0f, 1.0f },
+			};
+
+			vkCmdPushConstants(fd.command_buffer, vk_light_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+			                   sizeof(constants), &constants);
+
+			vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &cone_vertex_buffer.buffer, &vertex_buffer_offset);
+			vkCmdDraw(fd.command_buffer, uint32_t(cone_vertices.size()), 1, 0, 0);
+		}
 	}
 
 	vkCmdEndRenderPass(fd.command_buffer);
