@@ -11,6 +11,7 @@ layout(std140, set = 0, binding = 0) uniform SceneUniforms {
 	vec3 directional_light_direction;
 	vec3 directional_light_color;
 	vec3 ambient_light;
+	uint point_light_count;
 } scene_uniforms;
 
 layout(std140, set = 1, binding = 0) uniform ModelUniform {
@@ -19,6 +20,17 @@ layout(std140, set = 1, binding = 0) uniform ModelUniform {
 	vec3 specular;
 	float alpha;
 } model_uniforms;
+
+// Доп. задание 2: массив точечных источников в storage-буфере (ключевое слово buffer).
+// Размер массива не задаётся: шейдер берёт число источников из point_light_count.
+struct PointLight {
+	vec3 position;
+	vec3 color;
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer PointLights {
+	PointLight point_lights[];
+};
 
 // Модель Блинна-Фонга для одного источника (лекция 4):
 // C = I * (cos(theta) * Kd + Ks * cos(phi)^alpha), cos(theta) = n * l, cos(phi) = n * h.
@@ -48,6 +60,16 @@ void main() {
 	// Лучи направленного источника идут вдоль direction, а l — направление на источник
 	color += blinnPhong(n, v, -scene_uniforms.directional_light_direction,
 	                    scene_uniforms.directional_light_color);
+
+	for (uint i = 0; i < scene_uniforms.point_light_count; ++i) {
+		vec3 to_light = point_lights[i].position - in_world_position;
+		float distance = length(to_light);
+
+		// Закон обратных квадратов: освещённость падает как 1 / D^2
+		float attenuation = 1.0 / (distance * distance);
+
+		color += blinnPhong(n, v, to_light / distance, point_lights[i].color * attenuation);
+	}
 
 	out_color = vec4(color, 1.0);
 }

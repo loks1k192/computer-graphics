@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <vector>
 
 #include <imgui.h>
 
@@ -33,6 +34,7 @@ struct SceneUniforms {
 	math::Vector3 directional_light_color;     // 96
 	float _pad2;
 	math::Vector3 ambient_light;               // 112
+	uint32_t point_light_count;                // 124
 };
 
 // set = 1: матрица модели и материал одного объекта
@@ -73,6 +75,22 @@ const uint32_t icosahedron_indices[] = {
 
 constexpr uint32_t icosahedron_index_count = sizeof(icosahedron_indices) / sizeof(icosahedron_indices[0]);
 
+// Доп. задание 2: точечный источник в storage-буфере. Раскладка std430 совпадает
+// со struct PointLight в шейдере: vec3 выравнивается на 16 байт, размер структуры 32 байта.
+struct PointLightData {
+	math::Vector3 position; // 0
+	float _pad0;
+	math::Vector3 color;    // 16
+	float _pad1;
+};
+
+// Параметры точечного источника, которые меняются в интерфейсе
+struct PointLight {
+	math::Vector3 position;
+	math::Vector3 color;
+	float intensity;
+};
+
 // Геометрия в памяти видеокарты: вершины и индексы одной фигуры
 struct Mesh {
 	graphics::Buffer vertex_buffer;
@@ -100,10 +118,15 @@ float ortho_size = 7.0f;
 // Направленный источник: direction — куда идут лучи
 math::Vector3 directional_light_direction = { 0.4f, 1.0f, 0.6f };
 math::Vector3 directional_light_color = { 1.0f, 0.95f, 0.85f };
-float directional_light_intensity = 1.0f;
+float directional_light_intensity = 0.5f;
 
 math::Vector3 ambient_light_color = { 1.0f, 1.0f, 1.0f };
 float ambient_light_intensity = 0.1f;
+
+std::vector<PointLight> point_lights = {
+	{ { -4.5f, 1.0f, -1.5f }, { 1.0f, 0.5f, 0.2f }, 4.0f },
+	{ {  4.0f, 1.0f,  2.0f }, { 0.3f, 0.6f, 1.0f }, 4.0f },
+};
 
 bool animation_playing = true;
 float animation_speed = 1.0f;
@@ -149,6 +172,10 @@ int selected_object = 0;
 SceneUniforms scene_uniforms;
 graphics::Buffer scene_uniform_buffer;
 VkDescriptorSet scene_descriptor_set;
+
+// Storage-буфер растёт вместе с числом источников, capacity — сколько источников в нём помещается
+graphics::Buffer point_light_buffer;
+uint32_t point_light_capacity = 4;
 
 VkDescriptorSetLayout vk_scene_set_layout;
 VkDescriptorSetLayout vk_model_set_layout;
@@ -228,6 +255,11 @@ bool createBuffers() {
 		return false;
 	}
 
+	if (!graphics::createBuffer(point_light_capacity * sizeof(PointLightData),
+	                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, point_light_buffer)) {
+		return false;
+	}
+
 	for (Object& object : objects) {
 		if (!graphics::createBuffer(sizeof(ModelUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
 		                            object.uniform_buffer)) {
@@ -238,17 +270,64 @@ bool createBuffers() {
 	return true;
 }
 
+// Если элементов стало больше, чем помещается в буфер, создаём новый буфер в 2 раза больше.
+// Возвращает true, если буфер был пересоздан.
+bool growBuffer(graphics::Buffer& buffer, uint32_t& capacity, size_t count,
+                VkDeviceSize element_size, VkBufferUsageFlags usage) {
+	if (count <= capacity) {
+		return false;
+	}
+
+	graphics::destroyBuffer(buffer);
+
+	while (capacity < count) {
+		capacity *= 2;
+	}
+
+	if (!graphics::createBuffer(capacity * element_size, usage, buffer)) {
+		std::cerr << "Failed to grow buffer\n";
+	}
+
+	return true;
+}
+
+// Записывает в набор сцены дескриптор storage-буфера с источниками света
+void writeStorageDescriptor(uint32_t binding, const graphics::Buffer& buffer) {
+	const VkDescriptorBufferInfo buffer_descriptor = {
+		.buffer = buffer.buffer,
+		.offset = 0,
+		.range = VK_WHOLE_SIZE,
+	};
+
+	const VkWriteDescriptorSet write = {
+		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		.dstSet = scene_descriptor_set,
+		.dstBinding = binding,
+		.descriptorCount = 1,
+		.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+		.pBufferInfo = &buffer_descriptor,
+	};
+
+	vkUpdateDescriptorSets(graphics::internal::context.device, 1, &write, 0, nullptr);
+}
+
 bool createDescriptorSets() {
 	auto& context = graphics::internal::context;
 
-	// set = 0: uniform-буфер сцены. Вершинный шейдер берёт из него view_projection,
-	// фрагментный — камеру и свет.
+	// set = 0: uniform-буфер сцены и storage-буфер с массивом точечных источников.
+	// Вершинный шейдер берёт из uniform-буфера view_projection, фрагментный — камеру и свет.
 	const VkDescriptorSetLayoutBinding scene_bindings[] = {
 		{
 			.binding = 0,
 			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
 			.descriptorCount = 1,
 			.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+		},
+		{
+			.binding = 1,
+			.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+			.descriptorCount = 1,
+			.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
 		},
 	};
 
@@ -292,6 +371,10 @@ bool createDescriptorSets() {
 		{
 			.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
 			.descriptorCount = 1 + object_count,
+		},
+		{
+			.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+			.descriptorCount = 1,
 		},
 	};
 
@@ -339,6 +422,8 @@ bool createDescriptorSets() {
 
 	vkUpdateDescriptorSets(context.device, sizeof(scene_writes) / sizeof(scene_writes[0]),
 	                       scene_writes, 0, nullptr);
+
+	writeStorageDescriptor(1, point_light_buffer);
 
 	for (Object& object : objects) {
 		const VkDescriptorSetAllocateInfo model_set = {
@@ -602,6 +687,7 @@ void shutdown() {
 	for (const Object& object : objects) {
 		graphics::destroyBuffer(object.uniform_buffer);
 	}
+	graphics::destroyBuffer(point_light_buffer);
 	graphics::destroyBuffer(scene_uniform_buffer);
 	destroyMesh(floor_mesh);
 	destroyMesh(icosahedron_mesh);
@@ -641,6 +727,36 @@ void update(double time) {
 	if (ImGui::CollapsingHeader("Ambient light", ImGuiTreeNodeFlags_DefaultOpen)) {
 		ImGui::ColorEdit3("Color##ambient", &ambient_light_color.x);
 		ImGui::SliderFloat("Intensity##ambient", &ambient_light_intensity, 0.0f, 1.0f);
+	}
+
+	// Доп. задание 2: добавление, удаление и параметры точечных источников
+	if (ImGui::CollapsingHeader("Point lights", ImGuiTreeNodeFlags_DefaultOpen)) {
+		if (ImGui::Button("Add point light")) {
+			point_lights.push_back({ { 0.0f, 0.5f, 0.0f }, { 1.0f, 1.0f, 1.0f }, 3.0f });
+		}
+
+		int remove_index = -1;
+
+		for (int i = 0; i < int(point_lights.size()); ++i) {
+			PointLight& light = point_lights[i];
+
+			// PushID разделяет одинаковые надписи разных источников
+			ImGui::PushID(i);
+			if (ImGui::TreeNode("point", "Point light %d", i)) {
+				ImGui::SliderFloat3("Position", &light.position.x, -10.0f, 10.0f);
+				ImGui::ColorEdit3("Color", &light.color.x);
+				ImGui::SliderFloat("Intensity", &light.intensity, 0.0f, 20.0f);
+				if (ImGui::Button("Remove")) {
+					remove_index = i;
+				}
+				ImGui::TreePop();
+			}
+			ImGui::PopID();
+		}
+
+		if (remove_index >= 0) {
+			point_lights.erase(point_lights.begin() + remove_index);
+		}
 	}
 
 	if (ImGui::CollapsingHeader("Objects", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -703,6 +819,7 @@ void update(double time) {
 	scene_uniforms.directional_light_direction = math::normalize(light_direction);
 	scene_uniforms.directional_light_color = directional_light_color * directional_light_intensity;
 	scene_uniforms.ambient_light = ambient_light_color * ambient_light_intensity;
+	scene_uniforms.point_light_count = uint32_t(point_lights.size());
 
 	for (int i = 0; i < object_count; ++i) {
 		Object& object = objects[i];
@@ -739,6 +856,21 @@ void render(const graphics::internal::FrameData& fd) {
 	auto& context = graphics::internal::context;
 
 	memcpy(scene_uniform_buffer.memory, &scene_uniforms, sizeof(scene_uniforms));
+
+	// Доп. задание 2: если источников больше, чем помещается в storage-буфер, буфер пересоздаётся
+	// и набор сцены переписывается. Это безопасно: prepare() уже дождался, пока GPU закончит
+	// прошлый кадр, и старый буфер никто не читает.
+	if (growBuffer(point_light_buffer, point_light_capacity, point_lights.size(),
+	               sizeof(PointLightData), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) {
+		writeStorageDescriptor(1, point_light_buffer);
+	}
+
+	// Цвет и интенсивность передаются одним вектором: color * intensity
+	PointLightData* point_light_data = static_cast<PointLightData*>(point_light_buffer.memory);
+	for (size_t i = 0; i < point_lights.size(); ++i) {
+		point_light_data[i].position = point_lights[i].position;
+		point_light_data[i].color = point_lights[i].color * point_lights[i].intensity;
+	}
 
 	for (const Object& object : objects) {
 		memcpy(object.uniform_buffer.memory, &object.uniforms, sizeof(object.uniforms));

@@ -12,6 +12,7 @@ layout(std140, set = 0, binding = 0) uniform SceneUniforms {
 	vec3 directional_light_direction;
 	vec3 directional_light_color;
 	vec3 ambient_light;
+	uint point_light_count;
 } scene_uniforms;
 
 layout(std140, set = 1, binding = 0) uniform ModelUniform {
