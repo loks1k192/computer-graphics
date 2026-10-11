@@ -1,19 +1,30 @@
 #version 450 core
 
 layout(location = 0) in vec3 in_position;
-layout(location = 1) in vec3 in_color;
+layout(location = 1) in vec3 in_normal;
 
-layout(location = 0) out vec3 out_color;
+layout(location = 0) out vec3 out_world_position;
+layout(location = 1) out vec3 out_normal;
 
-// Данные текущего объекта: берутся из набора дескрипторов, привязанного перед отрисовкой
 layout(std140, set = 0, binding = 0) uniform ObjectUniforms {
-	mat4 matrix; // projection * view * model
-	vec4 color;  // цвет объекта из интерфейса
+	mat4 view_projection;
+	mat4 model;
+	vec3 camera_position;
+	vec3 light_direction;
+	vec3 light_color;
+	vec3 ambient_light;
+	vec3 albedo;
+	vec3 specular;
+	float alpha;
 } object_uniforms;
 
 void main() {
-	gl_Position = object_uniforms.matrix * vec4(in_position, 1);
+	vec4 world_position = object_uniforms.model * vec4(in_position, 1);
+	gl_Position = object_uniforms.view_projection * world_position;
 
-	// Цвет вершины умножается на цвет, выбранный в интерфейсе
-	out_color = in_color * object_uniforms.color.rgb;
+	// Освещение считается в мировых координатах. Нормаль умножается на обратную
+	// транспонированную матрицу: при неравномерном растяжении обычная матрица модели
+	// сделала бы нормаль не перпендикулярной поверхности.
+	out_world_position = world_position.xyz;
+	out_normal = transpose(inverse(mat3(object_uniforms.model))) * in_normal;
 }

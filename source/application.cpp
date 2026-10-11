@@ -14,56 +14,90 @@ namespace application {
 namespace {
 
 struct Vertex {
-	float position[3];
-	float color[3];
+	math::Vector3 position;
+	math::Vector3 normal;
 };
 
-
+// Раскладка по std140 должна совпадать с блоком ObjectUniforms в шейдерах.
+// vec3 выравнивается на 16 байт, поэтому после vec3 стоят 4 байта выравнивания,
+// а float alpha помещается сразу за vec3 specular.
 struct ObjectUniforms {
-	math::Matrix4 matrix; // projection * view * model
-	float color[4];
+	math::Matrix4 view_projection; // 0
+	math::Matrix4 model;           // 64
+	math::Vector3 camera_position; // 128
+	float _pad0;
+	math::Vector3 light_direction; // 144
+	float _pad1;
+	math::Vector3 light_color;     // 160
+	float _pad2;
+	math::Vector3 ambient_light;   // 176
+	float _pad3;
+	math::Vector3 albedo;          // 192
+	float _pad4;
+	math::Vector3 specular;        // 208
+	float alpha;                   // 220
 };
-
 
 const float phi = (1.0f + std::sqrt(5.0f)) / 2.0f;
 
-Vertex vertices[] = {
-	{ { -1.0f,  phi,  0.0f } },
-	{ {  1.0f,  phi,  0.0f } },
-	{ { -1.0f, -phi,  0.0f } },
-	{ {  1.0f, -phi,  0.0f } },
+const math::Vector3 icosahedron_positions[] = {
+	{ -1.0f,  phi,  0.0f },
+	{  1.0f,  phi,  0.0f },
+	{ -1.0f, -phi,  0.0f },
+	{  1.0f, -phi,  0.0f },
 
-	{ {  0.0f, -1.0f,  phi } },
-	{ {  0.0f,  1.0f,  phi } },
-	{ {  0.0f, -1.0f, -phi } },
-	{ {  0.0f,  1.0f, -phi } },
+	{  0.0f, -1.0f,  phi },
+	{  0.0f,  1.0f,  phi },
+	{  0.0f, -1.0f, -phi },
+	{  0.0f,  1.0f, -phi },
 
-	{ {  phi,  0.0f, -1.0f } },
-	{ {  phi,  0.0f,  1.0f } },
-	{ { -phi,  0.0f, -1.0f } },
-	{ { -phi,  0.0f,  1.0f } },
+	{  phi,  0.0f, -1.0f },
+	{  phi,  0.0f,  1.0f },
+	{ -phi,  0.0f, -1.0f },
+	{ -phi,  0.0f,  1.0f },
 };
 
-
-const uint32_t indices[] = {
+// Вершины каждой грани перечислены против часовой стрелки, если смотреть снаружи
+const uint32_t icosahedron_indices[] = {
 	0, 11, 5,   0, 5, 1,    0, 1, 7,    0, 7, 10,   0, 10, 11,
 	1, 5, 9,    5, 11, 4,   11, 10, 2,  10, 7, 6,   7, 1, 8,
 	3, 9, 4,    3, 4, 2,    3, 2, 6,    3, 6, 8,    3, 8, 9,
 	4, 9, 5,    2, 4, 11,   6, 2, 10,   8, 6, 7,    9, 8, 1,
 };
 
-constexpr uint32_t index_count = sizeof(indices) / sizeof(indices[0]);
+constexpr uint32_t icosahedron_index_count = sizeof(icosahedron_indices) / sizeof(icosahedron_indices[0]);
 
-constexpr float camera_distance = 6.0f;
+// Геометрия в памяти видеокарты: вершины и индексы одной фигуры
+struct Mesh {
+	graphics::Buffer vertex_buffer;
+	graphics::Buffer index_buffer;
+	uint32_t index_count;
+};
+
+Mesh icosahedron_mesh;
+Mesh floor_mesh;
+
 constexpr float z_near = 0.1f;
 constexpr float z_far = 100.0f;
 
-
-
+// Камера: позиция и поворот (в градусах). Ось Y направлена вниз, поэтому камера
+// над полом имеет отрицательный y. Pitch > 0 — взгляд вверх.
+math::Vector3 camera_position = { 0.0f, -3.5f, -10.0f };
+float camera_yaw = 0.0f;
+float camera_pitch = -20.0f;
+float camera_speed = 3.0f;
 
 int projection_type = 0;
 float fov_degrees = 60.0f;
 float ortho_size = 7.0f;
+
+// Направленный источник: direction — куда идут лучи
+math::Vector3 directional_light_direction = { 0.4f, 1.0f, 0.6f };
+math::Vector3 directional_light_color = { 1.0f, 0.95f, 0.85f };
+float directional_light_intensity = 1.0f;
+
+math::Vector3 ambient_light_color = { 1.0f, 1.0f, 1.0f };
+float ambient_light_intensity = 0.1f;
 
 bool animation_playing = true;
 float animation_speed = 1.0f;
@@ -72,31 +106,39 @@ float trajectory_height = 0.5f;
 float animation_time = 0.0f;
 double last_time = 0.0;
 
-
 struct Object {
-	float position[3];
-	float rotation[3];
-	float scale[3];
+	const Mesh* mesh;
+	bool animated; // летает ли объект по траектории из ЛР1
 
-	float color[3];
+	math::Vector3 position;
+	math::Vector3 rotation;
+	math::Vector3 scale;
+
+	// Материал по модели Блинна-Фонга
+	math::Vector3 albedo;
+	math::Vector3 specular;
+	float shininess;
 
 	ObjectUniforms uniforms;
 	graphics::Buffer uniform_buffer;
 	VkDescriptorSet descriptor_set;
 };
 
-constexpr int object_count = 3;
+constexpr int object_count = 4;
 
+// Три икосаэдра из ЛР1 и пол (квадрат 2x2, растянутый в 8 раз)
 Object objects[object_count] = {
-	{ .scale = { 0.6f, 0.6f, 0.6f }, .color = { 1.0f, 1.0f, 1.0f } },
-	{ .scale = { 0.6f, 0.6f, 0.6f }, .color = { 1.0f, 0.4f, 0.4f } },
-	{ .scale = { 0.6f, 0.6f, 0.6f }, .color = { 0.4f, 0.6f, 1.0f } },
+	{ .mesh = &icosahedron_mesh, .animated = true, .scale = { 0.6f, 0.6f, 0.6f },
+	  .albedo = { 0.9f, 0.9f, 0.9f }, .specular = { 1.0f, 1.0f, 1.0f }, .shininess = 32.0f },
+	{ .mesh = &icosahedron_mesh, .animated = true, .scale = { 0.6f, 0.6f, 0.6f },
+	  .albedo = { 0.9f, 0.2f, 0.2f }, .specular = { 1.0f, 1.0f, 1.0f }, .shininess = 128.0f },
+	{ .mesh = &icosahedron_mesh, .animated = true, .scale = { 0.6f, 0.6f, 0.6f },
+	  .albedo = { 0.2f, 0.4f, 0.9f }, .specular = { 0.5f, 0.5f, 0.5f }, .shininess = 8.0f },
+	{ .mesh = &floor_mesh, .animated = false, .position = { 0.0f, 2.0f, 0.0f }, .scale = { 8.0f, 1.0f, 8.0f },
+	  .albedo = { 0.6f, 0.6f, 0.6f }, .specular = { 0.2f, 0.2f, 0.2f }, .shininess = 16.0f },
 };
 
 int selected_object = 0;
-
-graphics::Buffer vertex_buffer;
-graphics::Buffer index_buffer;
 
 VkDescriptorSetLayout vk_descriptor_set_layout;
 VkDescriptorPool vk_descriptor_pool;
@@ -104,24 +146,71 @@ VkDescriptorPool vk_descriptor_pool;
 VkPipelineLayout vk_pipeline_layout;
 VkPipeline vk_pipeline;
 
+bool createMesh(const Vertex vertices[], uint32_t vertex_count,
+                const uint32_t indices[], uint32_t index_count, Mesh& mesh) {
+	if (!graphics::createBuffer(vertex_count * sizeof(Vertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+	                            mesh.vertex_buffer)) {
+		return false;
+	}
+	memcpy(mesh.vertex_buffer.memory, vertices, vertex_count * sizeof(Vertex));
+
+	if (!graphics::createBuffer(index_count * sizeof(uint32_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+	                            mesh.index_buffer)) {
+		return false;
+	}
+	memcpy(mesh.index_buffer.memory, indices, index_count * sizeof(uint32_t));
+
+	mesh.index_count = index_count;
+	return true;
+}
+
+void destroyMesh(const Mesh& mesh) {
+	graphics::destroyBuffer(mesh.index_buffer);
+	graphics::destroyBuffer(mesh.vertex_buffer);
+}
+
 bool createBuffers() {
-	const float radius = std::sqrt(1.0f + phi * phi);
+	// Нормали икосаэдра считаются процедурно: нормаль грани — векторное произведение
+	// двух её рёбер. Чтобы у каждой грани была своя нормаль, вершины между гранями
+	// не делятся: 20 граней по 3 вершины.
+	Vertex icosahedron_vertices[icosahedron_index_count];
+	uint32_t indices[icosahedron_index_count];
 
-	for (Vertex& vertex : vertices) {
-		for (int i = 0; i < 3; ++i) {
-			vertex.color[i] = vertex.position[i] / radius * 0.5f + 0.5f;
-		}
+	for (uint32_t i = 0; i < icosahedron_index_count; i += 3) {
+		const math::Vector3 a = icosahedron_positions[icosahedron_indices[i + 0]];
+		const math::Vector3 b = icosahedron_positions[icosahedron_indices[i + 1]];
+		const math::Vector3 c = icosahedron_positions[icosahedron_indices[i + 2]];
+
+		// Обход против часовой стрелки снаружи, поэтому нормаль смотрит наружу
+		const math::Vector3 normal = math::normalize(math::cross(b - a, c - a));
+
+		icosahedron_vertices[i + 0] = { a, normal };
+		icosahedron_vertices[i + 1] = { b, normal };
+		icosahedron_vertices[i + 2] = { c, normal };
+
+		indices[i + 0] = i + 0;
+		indices[i + 1] = i + 1;
+		indices[i + 2] = i + 2;
 	}
 
-	if (!graphics::createBuffer(sizeof(vertices), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertex_buffer)) {
+	if (!createMesh(icosahedron_vertices, icosahedron_index_count, indices, icosahedron_index_count,
+	                icosahedron_mesh)) {
 		return false;
 	}
-	memcpy(vertex_buffer.memory, vertices, sizeof(vertices));
 
-	if (!graphics::createBuffer(sizeof(indices), VK_BUFFER_USAGE_INDEX_BUFFER_BIT, index_buffer)) {
+	// Пол — квадрат в плоскости y = 0. Ось Y направлена вниз, поэтому нормаль (0, -1, 0).
+	const Vertex floor_vertices[] = {
+		{ { -1.0f, 0.0f, -1.0f }, { 0.0f, -1.0f, 0.0f } },
+		{ {  1.0f, 0.0f, -1.0f }, { 0.0f, -1.0f, 0.0f } },
+		{ {  1.0f, 0.0f,  1.0f }, { 0.0f, -1.0f, 0.0f } },
+		{ { -1.0f, 0.0f,  1.0f }, { 0.0f, -1.0f, 0.0f } },
+	};
+
+	const uint32_t floor_indices[] = { 0, 1, 2, 0, 2, 3 };
+
+	if (!createMesh(floor_vertices, 4, floor_indices, 6, floor_mesh)) {
 		return false;
 	}
-	memcpy(index_buffer.memory, indices, sizeof(indices));
 
 	for (Object& object : objects) {
 		if (!graphics::createBuffer(sizeof(ObjectUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
@@ -136,12 +225,13 @@ bool createBuffers() {
 bool createDescriptorSets() {
 	auto& context = graphics::internal::context;
 
+	// Uniform-буфер читают оба шейдера: вершинный берёт матрицы, фрагментный — свет и материал
 	const VkDescriptorSetLayoutBinding descriptor_set_bindings[] = {
 		{
 			.binding = 0,
 			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
 			.descriptorCount = 1,
-			.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+			.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 		},
 	};
 
@@ -267,7 +357,7 @@ bool createPipeline() {
 			.location = 1,
 			.binding = 0,
 			.format = VK_FORMAT_R32G32B32_SFLOAT,
-			.offset = offsetof(Vertex, color),
+			.offset = offsetof(Vertex, normal),
 		},
 	};
 
@@ -363,7 +453,46 @@ bool createPipeline() {
 	return true;
 }
 
+// Движение камеры с клавиатуры: WASD — вперёд/влево/назад/вправо, Q/E — вниз/вверх,
+// стрелки — поворот. Направления берутся из матрицы поворота камеры Ry(yaw) * Rx(pitch).
+void moveCamera(float delta_time) {
+	if (ImGui::GetIO().WantCaptureKeyboard) {
+		return;
+	}
+
+	const float yaw = math::radians(camera_yaw);
+	const float pitch = math::radians(camera_pitch);
+
+	const math::Vector3 forward = {
+		std::sin(yaw) * std::cos(pitch),
+		-std::sin(pitch),
+		std::cos(yaw) * std::cos(pitch),
+	};
+	const math::Vector3 right = { std::cos(yaw), 0.0f, -std::sin(yaw) };
+	const math::Vector3 up = { 0.0f, -1.0f, 0.0f };
+
+	math::Vector3 move = { 0.0f, 0.0f, 0.0f };
+	if (ImGui::IsKeyDown(ImGuiKey_W)) move = move + forward;
+	if (ImGui::IsKeyDown(ImGuiKey_S)) move = move - forward;
+	if (ImGui::IsKeyDown(ImGuiKey_D)) move = move + right;
+	if (ImGui::IsKeyDown(ImGuiKey_A)) move = move - right;
+	if (ImGui::IsKeyDown(ImGuiKey_E)) move = move + up;
+	if (ImGui::IsKeyDown(ImGuiKey_Q)) move = move - up;
+
+	camera_position = camera_position + move * (camera_speed * delta_time);
+
+	const float rotation_speed = 90.0f; // градусов в секунду
+	if (ImGui::IsKeyDown(ImGuiKey_LeftArrow)) camera_yaw -= rotation_speed * delta_time;
+	if (ImGui::IsKeyDown(ImGuiKey_RightArrow)) camera_yaw += rotation_speed * delta_time;
+	if (ImGui::IsKeyDown(ImGuiKey_UpArrow)) camera_pitch += rotation_speed * delta_time;
+	if (ImGui::IsKeyDown(ImGuiKey_DownArrow)) camera_pitch -= rotation_speed * delta_time;
+
+	if (camera_yaw > 180.0f) camera_yaw -= 360.0f;
+	if (camera_yaw < -180.0f) camera_yaw += 360.0f;
+	camera_pitch = std::fmin(std::fmax(camera_pitch, -89.0f), 89.0f);
 }
+
+} // namespace
 
 bool initialize() {
 	if (!createBuffers()) {
@@ -394,50 +523,84 @@ void shutdown() {
 	for (const Object& object : objects) {
 		graphics::destroyBuffer(object.uniform_buffer);
 	}
-	graphics::destroyBuffer(index_buffer);
-	graphics::destroyBuffer(vertex_buffer);
+	destroyMesh(floor_mesh);
+	destroyMesh(icosahedron_mesh);
 }
 
 void update(double time) {
 	const float delta_time = float(time - last_time);
 	last_time = time;
 
-	ImGui::Begin("Icosahedron");
+	ImGui::SetNextWindowSize(ImVec2(420.0f, 640.0f), ImGuiCond_FirstUseEver);
+	ImGui::Begin("Lab 2");
 
-	ImGui::SeparatorText("Projection");
-	ImGui::RadioButton("Perspective", &projection_type, 0);
-	ImGui::SameLine();
-	ImGui::RadioButton("Orthographic", &projection_type, 1);
-	if (projection_type == 0) {
-		ImGui::SliderFloat("FOV", &fov_degrees, 30.0f, 120.0f);
-	} else {
-		ImGui::SliderFloat("Size", &ortho_size, 2.0f, 20.0f);
+	if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
+		ImGui::SliderFloat3("Position##camera", &camera_position.x, -20.0f, 20.0f);
+		ImGui::SliderFloat("Yaw", &camera_yaw, -180.0f, 180.0f);
+		ImGui::SliderFloat("Pitch", &camera_pitch, -89.0f, 89.0f);
+		ImGui::SliderFloat("Speed##camera", &camera_speed, 0.5f, 10.0f);
+
+		ImGui::RadioButton("Perspective", &projection_type, 0);
+		ImGui::SameLine();
+		ImGui::RadioButton("Orthographic", &projection_type, 1);
+		if (projection_type == 0) {
+			ImGui::SliderFloat("FOV", &fov_degrees, 30.0f, 120.0f);
+		} else {
+			ImGui::SliderFloat("Size", &ortho_size, 2.0f, 20.0f);
+		}
+
+		ImGui::TextDisabled("WASD, Q/E - move, arrows - rotate");
 	}
 
-	ImGui::SeparatorText("Animation");
-	if (ImGui::Button(animation_playing ? "Pause" : "Play")) {
-		animation_playing = !animation_playing;
+	if (ImGui::CollapsingHeader("Directional light", ImGuiTreeNodeFlags_DefaultOpen)) {
+		ImGui::SliderFloat3("Direction##directional", &directional_light_direction.x, -1.0f, 1.0f);
+		ImGui::ColorEdit3("Color##directional", &directional_light_color.x);
+		ImGui::SliderFloat("Intensity##directional", &directional_light_intensity, 0.0f, 5.0f);
 	}
-	ImGui::SliderFloat("Speed", &animation_speed, 0.0f, 5.0f);
-	ImGui::SliderFloat("Radius", &trajectory_radius, 0.0f, 5.0f);
-	ImGui::SliderFloat("Wave height", &trajectory_height, 0.0f, 2.0f);
 
-	ImGui::SeparatorText("Object");
-	ImGui::SliderInt("Selected", &selected_object, 0, object_count - 1);
+	if (ImGui::CollapsingHeader("Ambient light", ImGuiTreeNodeFlags_DefaultOpen)) {
+		ImGui::ColorEdit3("Color##ambient", &ambient_light_color.x);
+		ImGui::SliderFloat("Intensity##ambient", &ambient_light_intensity, 0.0f, 1.0f);
+	}
 
-	Object& selected = objects[selected_object];
-	ImGui::SliderFloat3("Position", selected.position, -3.0f, 3.0f);
-	ImGui::SliderFloat3("Rotation", selected.rotation, -180.0f, 180.0f);
-	ImGui::SliderFloat3("Scale", selected.scale, 0.1f, 3.0f);
-	ImGui::ColorEdit3("Color", selected.color);
+	if (ImGui::CollapsingHeader("Objects", ImGuiTreeNodeFlags_DefaultOpen)) {
+		ImGui::SliderInt("Selected", &selected_object, 0, object_count - 1,
+		                 selected_object == object_count - 1 ? "Floor" : "Icosahedron %d");
+
+		Object& selected = objects[selected_object];
+		ImGui::SliderFloat3("Position##object", &selected.position.x, -5.0f, 5.0f);
+		ImGui::SliderFloat3("Rotation", &selected.rotation.x, -180.0f, 180.0f);
+		ImGui::SliderFloat3("Scale", &selected.scale.x, 0.1f, 10.0f);
+
+		ImGui::ColorEdit3("Albedo", &selected.albedo.x);
+		ImGui::ColorEdit3("Specular", &selected.specular.x);
+		ImGui::SliderFloat("Shininess", &selected.shininess, 1.0f, 1024.0f, "%.0f",
+		                   ImGuiSliderFlags_Logarithmic);
+	}
+
+	if (ImGui::CollapsingHeader("Animation")) {
+		if (ImGui::Button(animation_playing ? "Pause" : "Play")) {
+			animation_playing = !animation_playing;
+		}
+		ImGui::SliderFloat("Speed##animation", &animation_speed, 0.0f, 5.0f);
+		ImGui::SliderFloat("Radius", &trajectory_radius, 0.0f, 5.0f);
+		ImGui::SliderFloat("Wave height", &trajectory_height, 0.0f, 2.0f);
+	}
 
 	ImGui::End();
+
+	moveCamera(delta_time);
 
 	if (animation_playing) {
 		animation_time += delta_time * animation_speed;
 	}
 
-	const math::Matrix4 view = math::translation(0.0f, 0.0f, camera_distance);
+	// Матрица вида — обратная к матрице камеры C = T(position) * Ry(yaw) * Rx(pitch),
+	// поэтому множители идут в обратном порядке и с противоположными знаками (лекция 4)
+	const math::Matrix4 view =
+		math::rotationX(-math::radians(camera_pitch)) *
+		math::rotationY(-math::radians(camera_yaw)) *
+		math::translation(-camera_position.x, -camera_position.y, -camera_position.z);
 
 	const VkExtent2D extent = graphics::internal::context.swapchain_extent;
 	const float aspect = float(extent.width) / float(extent.height);
@@ -449,28 +612,48 @@ void update(double time) {
 		projection = math::orthographic(ortho_size * aspect, ortho_size, z_near, z_far);
 	}
 
+	const math::Matrix4 view_projection = projection * view;
+
+	// Направление света нормируем на CPU, чтобы не делать это для каждого пикселя
+	math::Vector3 light_direction = directional_light_direction;
+	if (math::length(light_direction) < 0.001f) {
+		light_direction = { 0.0f, 1.0f, 0.0f };
+	}
+	light_direction = math::normalize(light_direction);
+
 	for (int i = 0; i < object_count; ++i) {
 		Object& object = objects[i];
 
-		const float t = animation_time + 2.0f * math::pi * float(i) / float(object_count);
-		const float offset_x = trajectory_radius * std::cos(t);
-		const float offset_y = trajectory_height * std::sin(3.0f * t);
-		const float offset_z = trajectory_radius * std::sin(t);
+		math::Vector3 offset = { 0.0f, 0.0f, 0.0f };
+		float t = 0.0f;
+
+		if (object.animated) {
+			t = animation_time + 2.0f * math::pi * float(i) / 3.0f;
+			offset = {
+				trajectory_radius * std::cos(t),
+				trajectory_height * std::sin(3.0f * t),
+				trajectory_radius * std::sin(t),
+			};
+		}
+
+		const math::Vector3 position = object.position + offset;
 
 		const math::Matrix4 model =
-			math::translation(object.position[0] + offset_x, object.position[1] + offset_y,
-			                  object.position[2] + offset_z) *
-			math::rotationZ(math::radians(object.rotation[2])) *
-			math::rotationY(math::radians(object.rotation[1]) + t) *
-			math::rotationX(math::radians(object.rotation[0]) + t * 0.5f) *
-			math::scale(object.scale[0], object.scale[1], object.scale[2]);
+			math::translation(position.x, position.y, position.z) *
+			math::rotationZ(math::radians(object.rotation.z)) *
+			math::rotationY(math::radians(object.rotation.y) + t) *
+			math::rotationX(math::radians(object.rotation.x) + t * 0.5f) *
+			math::scale(object.scale.x, object.scale.y, object.scale.z);
 
-		object.uniforms.matrix = projection * view * model;
-
-		object.uniforms.color[0] = object.color[0];
-		object.uniforms.color[1] = object.color[1];
-		object.uniforms.color[2] = object.color[2];
-		object.uniforms.color[3] = 1.0f;
+		object.uniforms.view_projection = view_projection;
+		object.uniforms.model = model;
+		object.uniforms.camera_position = camera_position;
+		object.uniforms.light_direction = light_direction;
+		object.uniforms.light_color = directional_light_color * directional_light_intensity;
+		object.uniforms.ambient_light = ambient_light_color * ambient_light_intensity;
+		object.uniforms.albedo = object.albedo;
+		object.uniforms.specular = object.specular;
+		object.uniforms.alpha = object.shininess;
 	}
 }
 
@@ -491,7 +674,7 @@ void render(const graphics::internal::FrameData& fd) {
 	vkBeginCommandBuffer(fd.command_buffer, &command_buffer_begin);
 
 	const VkClearValue clear_values[] = {
-		{ .color = { .float32 = { 0.1f, 0.1f, 0.1f, 1.0f } } },
+		{ .color = { .float32 = { 0.02f, 0.02f, 0.03f, 1.0f } } },
 		{ .depthStencil = { 1.0f, 0 } },
 	};
 
@@ -522,15 +705,16 @@ void render(const graphics::internal::FrameData& fd) {
 
 	vkCmdBindPipeline(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline);
 
-	const VkDeviceSize vertex_buffer_offset = 0;
-	vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &vertex_buffer.buffer, &vertex_buffer_offset);
-	vkCmdBindIndexBuffer(fd.command_buffer, index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
-
 	for (const Object& object : objects) {
+		const VkDeviceSize vertex_buffer_offset = 0;
+		vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &object.mesh->vertex_buffer.buffer,
+		                       &vertex_buffer_offset);
+		vkCmdBindIndexBuffer(fd.command_buffer, object.mesh->index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+
 		vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_layout,
 		                        0, 1, &object.descriptor_set, 0, nullptr);
 
-		vkCmdDrawIndexed(fd.command_buffer, index_count, 1, 0, 0, 0);
+		vkCmdDrawIndexed(fd.command_buffer, object.mesh->index_count, 1, 0, 0, 0);
 	}
 
 	vkCmdEndRenderPass(fd.command_buffer);
@@ -538,4 +722,4 @@ void render(const graphics::internal::FrameData& fd) {
 	vkEndCommandBuffer(fd.command_buffer);
 }
 
-}
+} // namespace application

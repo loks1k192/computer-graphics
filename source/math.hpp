@@ -35,6 +35,40 @@ inline float radians(float degrees) {
 	return degrees * pi / 180.0f;
 }
 
+// Вектор из трёх чисел: точка, направление или цвет
+struct Vector3 {
+	float x, y, z;
+};
+
+inline Vector3 operator+(Vector3 a, Vector3 b) {
+	return { a.x + b.x, a.y + b.y, a.z + b.z };
+}
+
+inline Vector3 operator-(Vector3 a, Vector3 b) {
+	return { a.x - b.x, a.y - b.y, a.z - b.z };
+}
+
+inline Vector3 operator*(Vector3 v, float s) {
+	return { v.x * s, v.y * s, v.z * s };
+}
+
+inline float dot(Vector3 a, Vector3 b) {
+	return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+// Векторное произведение: вектор, перпендикулярный a и b
+inline Vector3 cross(Vector3 a, Vector3 b) {
+	return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x };
+}
+
+inline float length(Vector3 v) {
+	return std::sqrt(dot(v, v));
+}
+
+inline Vector3 normalize(Vector3 v) {
+	return v * (1.0f / length(v));
+}
+
 inline Matrix4 identity() {
 	Matrix4 result = {};
 	result.at(0, 0) = 1.0f;
