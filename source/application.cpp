@@ -35,6 +35,7 @@ struct SceneUniforms {
 	float _pad2;
 	math::Vector3 ambient_light;               // 112
 	uint32_t point_light_count;                // 124
+	uint32_t spot_light_count;                 // 128
 };
 
 // set = 1: матрица модели и материал одного объекта
@@ -91,6 +92,30 @@ struct PointLight {
 	float intensity;
 };
 
+// Доп. задание 3: прожекторный источник в storage-буфере, раскладка std430.
+// Вместо углов передаются их косинусы, чтобы не считать cos для каждого пикселя.
+// Размер структуры округляется до кратного 16 (выравнивание vec3), поэтому 64 байта.
+struct SpotLightData {
+	math::Vector3 position;  // 0
+	float _pad0;
+	math::Vector3 color;     // 16
+	float _pad1;
+	math::Vector3 direction; // 32
+	float inner_cutoff;      // 44
+	float outer_cutoff;      // 48
+	float _pad2[3];
+};
+
+// Параметры прожектора в интерфейсе. Углы — между осью прожектора и краем конуса, в градусах.
+struct SpotLight {
+	math::Vector3 position;
+	math::Vector3 direction;
+	math::Vector3 color;
+	float intensity;
+	float inner_angle;
+	float outer_angle;
+};
+
 // Геометрия в памяти видеокарты: вершины и индексы одной фигуры
 struct Mesh {
 	graphics::Buffer vertex_buffer;
@@ -126,6 +151,11 @@ float ambient_light_intensity = 0.1f;
 std::vector<PointLight> point_lights = {
 	{ { -4.5f, 1.0f, -1.5f }, { 1.0f, 0.5f, 0.2f }, 4.0f },
 	{ {  4.0f, 1.0f,  2.0f }, { 0.3f, 0.6f, 1.0f }, 4.0f },
+};
+
+std::vector<SpotLight> spot_lights = {
+	{ { 0.0f, -3.0f, 0.0f }, { 0.0f, 1.0f, 0.0f }, { 1.0f, 0.95f, 0.8f }, 20.0f, 15.0f, 25.0f },
+	{ { -4.0f, -1.0f, -3.0f }, { 0.6f, 0.6f, 0.5f }, { 0.4f, 1.0f, 0.4f }, 15.0f, 10.0f, 12.0f },
 };
 
 bool animation_playing = true;
@@ -176,6 +206,9 @@ VkDescriptorSet scene_descriptor_set;
 // Storage-буфер растёт вместе с числом источников, capacity — сколько источников в нём помещается
 graphics::Buffer point_light_buffer;
 uint32_t point_light_capacity = 4;
+
+graphics::Buffer spot_light_buffer;
+uint32_t spot_light_capacity = 4;
 
 VkDescriptorSetLayout vk_scene_set_layout;
 VkDescriptorSetLayout vk_model_set_layout;
@@ -260,6 +293,11 @@ bool createBuffers() {
 		return false;
 	}
 
+	if (!graphics::createBuffer(spot_light_capacity * sizeof(SpotLightData),
+	                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, spot_light_buffer)) {
+		return false;
+	}
+
 	for (Object& object : objects) {
 		if (!graphics::createBuffer(sizeof(ModelUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
 		                            object.uniform_buffer)) {
@@ -314,7 +352,7 @@ void writeStorageDescriptor(uint32_t binding, const graphics::Buffer& buffer) {
 bool createDescriptorSets() {
 	auto& context = graphics::internal::context;
 
-	// set = 0: uniform-буфер сцены и storage-буфер с массивом точечных источников.
+	// set = 0: uniform-буфер сцены и storage-буферы с массивами точечных и прожекторных источников.
 	// Вершинный шейдер берёт из uniform-буфера view_projection, фрагментный — камеру и свет.
 	const VkDescriptorSetLayoutBinding scene_bindings[] = {
 		{
@@ -325,6 +363,12 @@ bool createDescriptorSets() {
 		},
 		{
 			.binding = 1,
+			.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+			.descriptorCount = 1,
+			.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+		},
+		{
+			.binding = 2,
 			.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
 			.descriptorCount = 1,
 			.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -374,7 +418,7 @@ bool createDescriptorSets() {
 		},
 		{
 			.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-			.descriptorCount = 1,
+			.descriptorCount = 2,
 		},
 	};
 
@@ -424,6 +468,7 @@ bool createDescriptorSets() {
 	                       scene_writes, 0, nullptr);
 
 	writeStorageDescriptor(1, point_light_buffer);
+	writeStorageDescriptor(2, spot_light_buffer);
 
 	for (Object& object : objects) {
 		const VkDescriptorSetAllocateInfo model_set = {
@@ -687,6 +732,7 @@ void shutdown() {
 	for (const Object& object : objects) {
 		graphics::destroyBuffer(object.uniform_buffer);
 	}
+	graphics::destroyBuffer(spot_light_buffer);
 	graphics::destroyBuffer(point_light_buffer);
 	graphics::destroyBuffer(scene_uniform_buffer);
 	destroyMesh(floor_mesh);
@@ -759,6 +805,44 @@ void update(double time) {
 		}
 	}
 
+	// Доп. задание 3: добавление, удаление и параметры прожекторов
+	if (ImGui::CollapsingHeader("Spot lights", ImGuiTreeNodeFlags_DefaultOpen)) {
+		if (ImGui::Button("Add spot light")) {
+			spot_lights.push_back({ { 0.0f, -3.0f, 0.0f }, { 0.0f, 1.0f, 0.0f }, { 1.0f, 1.0f, 1.0f },
+			                        20.0f, 15.0f, 25.0f });
+		}
+
+		int remove_index = -1;
+
+		for (int i = 0; i < int(spot_lights.size()); ++i) {
+			SpotLight& light = spot_lights[i];
+
+			ImGui::PushID(i);
+			if (ImGui::TreeNode("spot", "Spot light %d", i)) {
+				ImGui::SliderFloat3("Position", &light.position.x, -10.0f, 10.0f);
+				ImGui::SliderFloat3("Direction", &light.direction.x, -1.0f, 1.0f);
+				ImGui::ColorEdit3("Color", &light.color.x);
+				ImGui::SliderFloat("Intensity", &light.intensity, 0.0f, 50.0f);
+				ImGui::SliderFloat("Inner angle", &light.inner_angle, 0.0f, 80.0f);
+				ImGui::SliderFloat("Outer angle", &light.outer_angle, 0.0f, 80.0f);
+				if (ImGui::Button("Remove")) {
+					remove_index = i;
+				}
+				ImGui::TreePop();
+			}
+			ImGui::PopID();
+
+			// Внешний угол не может быть меньше внутреннего. Если они равны, край будет резким.
+			if (light.outer_angle < light.inner_angle) {
+				light.outer_angle = light.inner_angle;
+			}
+		}
+
+		if (remove_index >= 0) {
+			spot_lights.erase(spot_lights.begin() + remove_index);
+		}
+	}
+
 	if (ImGui::CollapsingHeader("Objects", ImGuiTreeNodeFlags_DefaultOpen)) {
 		ImGui::SliderInt("Selected", &selected_object, 0, object_count - 1,
 		                 selected_object == object_count - 1 ? "Floor" : "Icosahedron %d");
@@ -820,6 +904,7 @@ void update(double time) {
 	scene_uniforms.directional_light_color = directional_light_color * directional_light_intensity;
 	scene_uniforms.ambient_light = ambient_light_color * ambient_light_intensity;
 	scene_uniforms.point_light_count = uint32_t(point_lights.size());
+	scene_uniforms.spot_light_count = uint32_t(spot_lights.size());
 
 	for (int i = 0; i < object_count; ++i) {
 		Object& object = objects[i];
@@ -870,6 +955,28 @@ void render(const graphics::internal::FrameData& fd) {
 	for (size_t i = 0; i < point_lights.size(); ++i) {
 		point_light_data[i].position = point_lights[i].position;
 		point_light_data[i].color = point_lights[i].color * point_lights[i].intensity;
+	}
+
+	// Доп. задание 3: то же самое для прожекторов
+	if (growBuffer(spot_light_buffer, spot_light_capacity, spot_lights.size(),
+	               sizeof(SpotLightData), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) {
+		writeStorageDescriptor(2, spot_light_buffer);
+	}
+
+	SpotLightData* spot_light_data = static_cast<SpotLightData*>(spot_light_buffer.memory);
+	for (size_t i = 0; i < spot_lights.size(); ++i) {
+		const SpotLight& light = spot_lights[i];
+
+		math::Vector3 direction = light.direction;
+		if (math::length(direction) < 0.001f) {
+			direction = { 0.0f, 1.0f, 0.0f };
+		}
+
+		spot_light_data[i].position = light.position;
+		spot_light_data[i].color = light.color * light.intensity;
+		spot_light_data[i].direction = math::normalize(direction);
+		spot_light_data[i].inner_cutoff = std::cos(math::radians(light.inner_angle));
+		spot_light_data[i].outer_cutoff = std::cos(math::radians(light.outer_angle));
 	}
 
 	for (const Object& object : objects) {

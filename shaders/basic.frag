@@ -12,6 +12,7 @@ layout(std140, set = 0, binding = 0) uniform SceneUniforms {
 	vec3 directional_light_color;
 	vec3 ambient_light;
 	uint point_light_count;
+	uint spot_light_count;
 } scene_uniforms;
 
 layout(std140, set = 1, binding = 0) uniform ModelUniform {
@@ -30,6 +31,20 @@ struct PointLight {
 
 layout(std430, set = 0, binding = 1) readonly buffer PointLights {
 	PointLight point_lights[];
+};
+
+// Доп. задание 3: массив прожекторов. inner_cutoff и outer_cutoff — косинусы
+// внутреннего и внешнего углов конуса.
+struct SpotLight {
+	vec3 position;
+	vec3 color;
+	vec3 direction;
+	float inner_cutoff;
+	float outer_cutoff;
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer SpotLights {
+	SpotLight spot_lights[];
 };
 
 // Модель Блинна-Фонга для одного источника (лекция 4):
@@ -69,6 +84,23 @@ void main() {
 		float attenuation = 1.0 / (distance * distance);
 
 		color += blinnPhong(n, v, to_light / distance, point_lights[i].color * attenuation);
+	}
+
+	for (uint i = 0; i < scene_uniforms.spot_light_count; ++i) {
+		vec3 to_light = spot_lights[i].position - in_world_position;
+		float distance = length(to_light);
+		vec3 l = to_light / distance;
+
+		float attenuation = 1.0 / (distance * distance);
+
+		// Мягкие края: косинус угла между осью прожектора и лучом на точку сравнивается
+		// с косинусами углов конуса. Внутри внутреннего конуса множитель 1, снаружи
+		// внешнего — 0, между ними плавно убывает. Если углы равны, край резкий.
+		float cos_angle = dot(-l, spot_lights[i].direction);
+		float edge = max(spot_lights[i].inner_cutoff - spot_lights[i].outer_cutoff, 0.0001);
+		float spot = clamp((cos_angle - spot_lights[i].outer_cutoff) / edge, 0.0, 1.0);
+
+		color += blinnPhong(n, v, l, spot_lights[i].color * attenuation * spot);
 	}
 
 	out_color = vec4(color, 1.0);
