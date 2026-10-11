@@ -18,24 +18,30 @@ struct Vertex {
 	math::Vector3 normal;
 };
 
-// Раскладка по std140 должна совпадать с блоком ObjectUniforms в шейдерах.
-// vec3 выравнивается на 16 байт, поэтому после vec3 стоят 4 байта выравнивания,
-// а float alpha помещается сразу за vec3 specular.
-struct ObjectUniforms {
-	math::Matrix4 view_projection; // 0
-	math::Matrix4 model;           // 64
-	math::Vector3 camera_position; // 128
+// Доп. задание 1: данные разделены на два набора дескрипторов.
+// Раскладки по std140 должны совпадать с блоками в шейдерах: vec3 выравнивается
+// на 16 байт, поэтому после vec3 стоят 4 байта выравнивания, а float может
+// поместиться сразу за vec3.
+
+// set = 0: общие для всей сцены данные, один буфер на всю сцену
+struct SceneUniforms {
+	math::Matrix4 view_projection;             // 0
+	math::Vector3 camera_position;             // 64
 	float _pad0;
-	math::Vector3 light_direction; // 144
+	math::Vector3 directional_light_direction; // 80
 	float _pad1;
-	math::Vector3 light_color;     // 160
+	math::Vector3 directional_light_color;     // 96
 	float _pad2;
-	math::Vector3 ambient_light;   // 176
-	float _pad3;
-	math::Vector3 albedo;          // 192
-	float _pad4;
-	math::Vector3 specular;        // 208
-	float alpha;                   // 220
+	math::Vector3 ambient_light;               // 112
+};
+
+// set = 1: матрица модели и материал одного объекта
+struct ModelUniforms {
+	math::Matrix4 model;    // 0
+	math::Vector3 albedo;   // 64
+	float _pad0;
+	math::Vector3 specular; // 80
+	float alpha;            // 92
 };
 
 const float phi = (1.0f + std::sqrt(5.0f)) / 2.0f;
@@ -119,7 +125,7 @@ struct Object {
 	math::Vector3 specular;
 	float shininess;
 
-	ObjectUniforms uniforms;
+	ModelUniforms uniforms;
 	graphics::Buffer uniform_buffer;
 	VkDescriptorSet descriptor_set;
 };
@@ -140,7 +146,12 @@ Object objects[object_count] = {
 
 int selected_object = 0;
 
-VkDescriptorSetLayout vk_descriptor_set_layout;
+SceneUniforms scene_uniforms;
+graphics::Buffer scene_uniform_buffer;
+VkDescriptorSet scene_descriptor_set;
+
+VkDescriptorSetLayout vk_scene_set_layout;
+VkDescriptorSetLayout vk_model_set_layout;
 VkDescriptorPool vk_descriptor_pool;
 
 VkPipelineLayout vk_pipeline_layout;
@@ -212,8 +223,13 @@ bool createBuffers() {
 		return false;
 	}
 
+	if (!graphics::createBuffer(sizeof(SceneUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+	                            scene_uniform_buffer)) {
+		return false;
+	}
+
 	for (Object& object : objects) {
-		if (!graphics::createBuffer(sizeof(ObjectUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+		if (!graphics::createBuffer(sizeof(ModelUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
 		                            object.uniform_buffer)) {
 			return false;
 		}
@@ -225,8 +241,9 @@ bool createBuffers() {
 bool createDescriptorSets() {
 	auto& context = graphics::internal::context;
 
-	// Uniform-буфер читают оба шейдера: вершинный берёт матрицы, фрагментный — свет и материал
-	const VkDescriptorSetLayoutBinding descriptor_set_bindings[] = {
+	// set = 0: uniform-буфер сцены. Вершинный шейдер берёт из него view_projection,
+	// фрагментный — камеру и свет.
+	const VkDescriptorSetLayoutBinding scene_bindings[] = {
 		{
 			.binding = 0,
 			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
@@ -235,28 +252,52 @@ bool createDescriptorSets() {
 		},
 	};
 
-	const VkDescriptorSetLayoutCreateInfo descriptor_set_layout = {
+	const VkDescriptorSetLayoutCreateInfo scene_set_layout = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-		.bindingCount = sizeof(descriptor_set_bindings) / sizeof(descriptor_set_bindings[0]),
-		.pBindings = descriptor_set_bindings,
+		.bindingCount = sizeof(scene_bindings) / sizeof(scene_bindings[0]),
+		.pBindings = scene_bindings,
 	};
 
-	if (vkCreateDescriptorSetLayout(context.device, &descriptor_set_layout, nullptr,
-	                                &vk_descriptor_set_layout) != VK_SUCCESS) {
-		std::cerr << "Failed to create descriptor set layout\n";
+	if (vkCreateDescriptorSetLayout(context.device, &scene_set_layout, nullptr,
+	                                &vk_scene_set_layout) != VK_SUCCESS) {
+		std::cerr << "Failed to create scene descriptor set layout\n";
 		return false;
 	}
 
+	// set = 1: uniform-буфер модели. Вершинный шейдер берёт матрицу модели,
+	// фрагментный — материал.
+	const VkDescriptorSetLayoutBinding model_bindings[] = {
+		{
+			.binding = 0,
+			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+			.descriptorCount = 1,
+			.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+		},
+	};
+
+	const VkDescriptorSetLayoutCreateInfo model_set_layout = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+		.bindingCount = sizeof(model_bindings) / sizeof(model_bindings[0]),
+		.pBindings = model_bindings,
+	};
+
+	if (vkCreateDescriptorSetLayout(context.device, &model_set_layout, nullptr,
+	                                &vk_model_set_layout) != VK_SUCCESS) {
+		std::cerr << "Failed to create model descriptor set layout\n";
+		return false;
+	}
+
+	// Один набор сцены и по набору на каждый объект
 	const VkDescriptorPoolSize descriptor_pool_sizes[] = {
 		{
 			.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-			.descriptorCount = object_count,
+			.descriptorCount = 1 + object_count,
 		},
 	};
 
 	const VkDescriptorPoolCreateInfo descriptor_pool = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-		.maxSets = object_count,
+		.maxSets = 1 + object_count,
 		.poolSizeCount = sizeof(descriptor_pool_sizes) / sizeof(descriptor_pool_sizes[0]),
 		.pPoolSizes = descriptor_pool_sizes,
 	};
@@ -267,39 +308,70 @@ bool createDescriptorSets() {
 		return false;
 	}
 
+	const VkDescriptorSetAllocateInfo scene_set = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+		.descriptorPool = vk_descriptor_pool,
+		.descriptorSetCount = 1,
+		.pSetLayouts = &vk_scene_set_layout,
+	};
+
+	if (vkAllocateDescriptorSets(context.device, &scene_set, &scene_descriptor_set) != VK_SUCCESS) {
+		std::cerr << "Failed to allocate scene descriptor set\n";
+		return false;
+	}
+
+	const VkDescriptorBufferInfo scene_buffer_descriptor = {
+		.buffer = scene_uniform_buffer.buffer,
+		.offset = 0,
+		.range = sizeof(SceneUniforms),
+	};
+
+	const VkWriteDescriptorSet scene_writes[] = {
+		{
+			.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+			.dstSet = scene_descriptor_set,
+			.dstBinding = 0,
+			.descriptorCount = 1,
+			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+			.pBufferInfo = &scene_buffer_descriptor,
+		},
+	};
+
+	vkUpdateDescriptorSets(context.device, sizeof(scene_writes) / sizeof(scene_writes[0]),
+	                       scene_writes, 0, nullptr);
+
 	for (Object& object : objects) {
-		const VkDescriptorSetAllocateInfo descriptor_set = {
+		const VkDescriptorSetAllocateInfo model_set = {
 			.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
 			.descriptorPool = vk_descriptor_pool,
 			.descriptorSetCount = 1,
-			.pSetLayouts = &vk_descriptor_set_layout,
+			.pSetLayouts = &vk_model_set_layout,
 		};
 
-		if (vkAllocateDescriptorSets(context.device, &descriptor_set,
-		                             &object.descriptor_set) != VK_SUCCESS) {
-			std::cerr << "Failed to allocate descriptor set\n";
+		if (vkAllocateDescriptorSets(context.device, &model_set, &object.descriptor_set) != VK_SUCCESS) {
+			std::cerr << "Failed to allocate model descriptor set\n";
 			return false;
 		}
 
-		const VkDescriptorBufferInfo uniform_buffer_descriptor = {
+		const VkDescriptorBufferInfo model_buffer_descriptor = {
 			.buffer = object.uniform_buffer.buffer,
 			.offset = 0,
-			.range = sizeof(ObjectUniforms),
+			.range = sizeof(ModelUniforms),
 		};
 
-		const VkWriteDescriptorSet descriptor_writes[] = {
+		const VkWriteDescriptorSet model_writes[] = {
 			{
 				.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
 				.dstSet = object.descriptor_set,
 				.dstBinding = 0,
 				.descriptorCount = 1,
 				.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-				.pBufferInfo = &uniform_buffer_descriptor,
+				.pBufferInfo = &model_buffer_descriptor,
 			},
 		};
 
-		vkUpdateDescriptorSets(context.device, sizeof(descriptor_writes) / sizeof(descriptor_writes[0]),
-		                       descriptor_writes, 0, nullptr);
+		vkUpdateDescriptorSets(context.device, sizeof(model_writes) / sizeof(model_writes[0]),
+		                       model_writes, 0, nullptr);
 	}
 
 	return true;
@@ -308,10 +380,16 @@ bool createDescriptorSets() {
 bool createPipeline() {
 	auto& context = graphics::internal::context;
 
+	// Номер описания в массиве — это номер set в шейдере
+	const VkDescriptorSetLayout set_layouts[] = {
+		vk_scene_set_layout,
+		vk_model_set_layout,
+	};
+
 	const VkPipelineLayoutCreateInfo pipeline_layout = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-		.setLayoutCount = 1,
-		.pSetLayouts = &vk_descriptor_set_layout,
+		.setLayoutCount = sizeof(set_layouts) / sizeof(set_layouts[0]),
+		.pSetLayouts = set_layouts,
 	};
 
 	if (vkCreatePipelineLayout(context.device, &pipeline_layout, nullptr,
@@ -518,11 +596,13 @@ void shutdown() {
 	vkDestroyPipelineLayout(context.device, vk_pipeline_layout, nullptr);
 
 	vkDestroyDescriptorPool(context.device, vk_descriptor_pool, nullptr);
-	vkDestroyDescriptorSetLayout(context.device, vk_descriptor_set_layout, nullptr);
+	vkDestroyDescriptorSetLayout(context.device, vk_model_set_layout, nullptr);
+	vkDestroyDescriptorSetLayout(context.device, vk_scene_set_layout, nullptr);
 
 	for (const Object& object : objects) {
 		graphics::destroyBuffer(object.uniform_buffer);
 	}
+	graphics::destroyBuffer(scene_uniform_buffer);
 	destroyMesh(floor_mesh);
 	destroyMesh(icosahedron_mesh);
 }
@@ -612,14 +692,17 @@ void update(double time) {
 		projection = math::orthographic(ortho_size * aspect, ortho_size, z_near, z_far);
 	}
 
-	const math::Matrix4 view_projection = projection * view;
-
 	// Направление света нормируем на CPU, чтобы не делать это для каждого пикселя
 	math::Vector3 light_direction = directional_light_direction;
 	if (math::length(light_direction) < 0.001f) {
 		light_direction = { 0.0f, 1.0f, 0.0f };
 	}
-	light_direction = math::normalize(light_direction);
+
+	scene_uniforms.view_projection = projection * view;
+	scene_uniforms.camera_position = camera_position;
+	scene_uniforms.directional_light_direction = math::normalize(light_direction);
+	scene_uniforms.directional_light_color = directional_light_color * directional_light_intensity;
+	scene_uniforms.ambient_light = ambient_light_color * ambient_light_intensity;
 
 	for (int i = 0; i < object_count; ++i) {
 		Object& object = objects[i];
@@ -645,12 +728,7 @@ void update(double time) {
 			math::rotationX(math::radians(object.rotation.x) + t * 0.5f) *
 			math::scale(object.scale.x, object.scale.y, object.scale.z);
 
-		object.uniforms.view_projection = view_projection;
 		object.uniforms.model = model;
-		object.uniforms.camera_position = camera_position;
-		object.uniforms.light_direction = light_direction;
-		object.uniforms.light_color = directional_light_color * directional_light_intensity;
-		object.uniforms.ambient_light = ambient_light_color * ambient_light_intensity;
 		object.uniforms.albedo = object.albedo;
 		object.uniforms.specular = object.specular;
 		object.uniforms.alpha = object.shininess;
@@ -659,6 +737,8 @@ void update(double time) {
 
 void render(const graphics::internal::FrameData& fd) {
 	auto& context = graphics::internal::context;
+
+	memcpy(scene_uniform_buffer.memory, &scene_uniforms, sizeof(scene_uniforms));
 
 	for (const Object& object : objects) {
 		memcpy(object.uniform_buffer.memory, &object.uniforms, sizeof(object.uniforms));
@@ -705,14 +785,19 @@ void render(const graphics::internal::FrameData& fd) {
 
 	vkCmdBindPipeline(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline);
 
+	// set = 0 общий для всех объектов, поэтому привязывается один раз за кадр
+	vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_layout,
+	                        0, 1, &scene_descriptor_set, 0, nullptr);
+
 	for (const Object& object : objects) {
 		const VkDeviceSize vertex_buffer_offset = 0;
 		vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &object.mesh->vertex_buffer.buffer,
 		                       &vertex_buffer_offset);
 		vkCmdBindIndexBuffer(fd.command_buffer, object.mesh->index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
 
+		// set = 1 меняется перед каждым объектом, set = 0 при этом остаётся привязанным
 		vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_layout,
-		                        0, 1, &object.descriptor_set, 0, nullptr);
+		                        1, 1, &object.descriptor_set, 0, nullptr);
 
 		vkCmdDrawIndexed(fd.command_buffer, object.mesh->index_count, 1, 0, 0, 0);
 	}
