@@ -184,6 +184,7 @@ struct Object {
 	math::Vector3 scale;
 
 	// Материал по модели Блинна-Фонга: альбедо берётся из текстуры
+	int texture; // доп. задание 1: индекс текстуры (материала) из списка
 	math::Vector3 specular;
 	float shininess;
 };
@@ -193,13 +194,13 @@ constexpr int object_count = 4;
 // Три икосаэдра из ЛР1 и пол (квадрат 2x2, растянутый в 8 раз)
 Object objects[object_count] = {
 	{ .mesh = &icosahedron_mesh, .animated = true, .scale = { 0.6f, 0.6f, 0.6f },
-	  .specular = { 1.0f, 1.0f, 1.0f }, .shininess = 32.0f },
+	  .texture = 0, .specular = { 0.5f, 0.5f, 0.5f }, .shininess = 32.0f },
 	{ .mesh = &icosahedron_mesh, .animated = true, .scale = { 0.6f, 0.6f, 0.6f },
-	  .specular = { 1.0f, 1.0f, 1.0f }, .shininess = 128.0f },
+	  .texture = 2, .specular = { 1.0f, 1.0f, 1.0f }, .shininess = 128.0f },
 	{ .mesh = &icosahedron_mesh, .animated = true, .scale = { 0.6f, 0.6f, 0.6f },
-	  .specular = { 0.5f, 0.5f, 0.5f }, .shininess = 8.0f },
+	  .texture = 4, .specular = { 0.8f, 0.8f, 0.8f }, .shininess = 64.0f },
 	{ .mesh = &floor_mesh, .animated = false, .position = { 0.0f, 2.0f, 0.0f }, .scale = { 8.0f, 1.0f, 8.0f },
-	  .specular = { 0.2f, 0.2f, 0.2f }, .shininess = 16.0f },
+	  .texture = 3, .specular = { 0.3f, 0.3f, 0.3f }, .shininess = 16.0f },
 };
 
 int selected_object = 0;
@@ -223,12 +224,28 @@ graphics::Buffer model_uniform_buffer;
 uint32_t model_uniform_capacity = 16;
 VkDeviceSize model_uniform_stride;
 
-// Текстура альбедо и сэмплер: как читать текстуру (фильтрация, повтор за краями)
-graphics::Texture texture;
-VkSampler vk_sampler;
+// Доп. задание 1: несколько текстур, у каждой (у каждого материала) свой набор дескрипторов
+// set = 1: динамический uniform-буфер свойств моделей (общий) и своя текстура
+struct Material {
+	graphics::Texture texture;
+	VkDescriptorSet descriptor_set;
+};
 
-// set = 1: динамический uniform-буфер свойств моделей и текстура (изображение + сэмплер)
-VkDescriptorSet material_descriptor_set;
+constexpr int texture_count = 5;
+
+const char* const texture_names[texture_count] = { "Bricks", "Wood", "Marble", "Tiles", "Rusty metal" };
+const char* const texture_paths[texture_count] = {
+	"textures/bricks.png",
+	"textures/wood.png",
+	"textures/marble.png",
+	"textures/tiles.png",
+	"textures/rusty_metal.png",
+};
+
+Material materials[texture_count];
+
+// Сэмплер общий для всех текстур: как читать текстуру (фильтрация, повтор за краями)
+VkSampler vk_sampler;
 
 VkDescriptorSetLayout vk_scene_set_layout;
 VkDescriptorSetLayout vk_material_set_layout;
@@ -299,12 +316,12 @@ bool createMeshes() {
 	}
 
 	// Пол — квадрат в плоскости y = 0. Ось Y направлена вниз, поэтому нормаль (0, -1, 0).
-	// Текстурные координаты от 0 до 8: при режиме REPEAT текстура повторится 8 раз.
+	// Текстурные координаты от 0 до 4: при режиме REPEAT текстура повторится 4 раза.
 	const Vertex floor_vertices[] = {
 		{ { -1.0f, 0.0f, -1.0f }, { 0.0f, -1.0f, 0.0f }, { 0.0f, 0.0f } },
-		{ {  1.0f, 0.0f, -1.0f }, { 0.0f, -1.0f, 0.0f }, { 8.0f, 0.0f } },
-		{ {  1.0f, 0.0f,  1.0f }, { 0.0f, -1.0f, 0.0f }, { 8.0f, 8.0f } },
-		{ { -1.0f, 0.0f,  1.0f }, { 0.0f, -1.0f, 0.0f }, { 0.0f, 8.0f } },
+		{ {  1.0f, 0.0f, -1.0f }, { 0.0f, -1.0f, 0.0f }, { 4.0f, 0.0f } },
+		{ {  1.0f, 0.0f,  1.0f }, { 0.0f, -1.0f, 0.0f }, { 4.0f, 4.0f } },
+		{ { -1.0f, 0.0f,  1.0f }, { 0.0f, -1.0f, 0.0f }, { 0.0f, 4.0f } },
 	};
 
 	const uint32_t floor_indices[] = { 0, 1, 2, 0, 2, 3 };
@@ -415,8 +432,10 @@ bool createBuffers() {
 bool createTextures() {
 	auto& context = graphics::internal::context;
 
-	if (!graphics::loadTexture("textures/bricks.png", texture)) {
-		return false;
+	for (int i = 0; i < texture_count; ++i) {
+		if (!graphics::loadTexture(texture_paths[i], materials[i].texture)) {
+			return false;
+		}
 	}
 
 	// Линейная фильтрация сглаживает текстуру при увеличении и уменьшении,
@@ -574,7 +593,7 @@ bool createDescriptorSets() {
 		return false;
 	}
 
-	// Один набор сцены и один набор материала на все объекты
+	// Один набор сцены и по набору на каждый материал (текстуру)
 	const VkDescriptorPoolSize descriptor_pool_sizes[] = {
 		{
 			.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
@@ -586,17 +605,17 @@ bool createDescriptorSets() {
 		},
 		{
 			.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
-			.descriptorCount = 1,
+			.descriptorCount = texture_count,
 		},
 		{
 			.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-			.descriptorCount = 1,
+			.descriptorCount = texture_count,
 		},
 	};
 
 	const VkDescriptorPoolCreateInfo descriptor_pool = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-		.maxSets = 2,
+		.maxSets = 1 + texture_count,
 		.poolSizeCount = sizeof(descriptor_pool_sizes) / sizeof(descriptor_pool_sizes[0]),
 		.pPoolSizes = descriptor_pool_sizes,
 	};
@@ -642,37 +661,40 @@ bool createDescriptorSets() {
 	writeStorageDescriptor(1, point_light_buffer);
 	writeStorageDescriptor(2, spot_light_buffer);
 
-	const VkDescriptorSetAllocateInfo material_set = {
-		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-		.descriptorPool = vk_descriptor_pool,
-		.descriptorSetCount = 1,
-		.pSetLayouts = &vk_material_set_layout,
-	};
+	// Наборы материалов отличаются только текстурой, динамический uniform-буфер у них общий
+	for (Material& material : materials) {
+		const VkDescriptorSetAllocateInfo material_set = {
+			.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+			.descriptorPool = vk_descriptor_pool,
+			.descriptorSetCount = 1,
+			.pSetLayouts = &vk_material_set_layout,
+		};
 
-	if (vkAllocateDescriptorSets(context.device, &material_set, &material_descriptor_set) != VK_SUCCESS) {
-		std::cerr << "Failed to allocate material descriptor set\n";
-		return false;
+		if (vkAllocateDescriptorSets(context.device, &material_set, &material.descriptor_set) != VK_SUCCESS) {
+			std::cerr << "Failed to allocate material descriptor set\n";
+			return false;
+		}
+
+		writeModelDescriptor(material.descriptor_set);
+
+		// Кортеж изображение-сэмплер: шейдер читает текстуру в раскладке SHADER_READ_ONLY_OPTIMAL
+		const VkDescriptorImageInfo image_descriptor = {
+			.sampler = vk_sampler,
+			.imageView = material.texture.view,
+			.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		};
+
+		const VkWriteDescriptorSet image_write = {
+			.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+			.dstSet = material.descriptor_set,
+			.dstBinding = 1,
+			.descriptorCount = 1,
+			.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+			.pImageInfo = &image_descriptor,
+		};
+
+		vkUpdateDescriptorSets(context.device, 1, &image_write, 0, nullptr);
 	}
-
-	writeModelDescriptor(material_descriptor_set);
-
-	// Кортеж изображение-сэмплер: шейдер читает текстуру в раскладке SHADER_READ_ONLY_OPTIMAL
-	const VkDescriptorImageInfo image_descriptor = {
-		.sampler = vk_sampler,
-		.imageView = texture.view,
-		.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-	};
-
-	const VkWriteDescriptorSet image_write = {
-		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-		.dstSet = material_descriptor_set,
-		.dstBinding = 1,
-		.descriptorCount = 1,
-		.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-		.pImageInfo = &image_descriptor,
-	};
-
-	vkUpdateDescriptorSets(context.device, 1, &image_write, 0, nullptr);
 
 	return true;
 }
@@ -977,7 +999,9 @@ void shutdown() {
 	vkDestroyDescriptorSetLayout(context.device, vk_scene_set_layout, nullptr);
 
 	vkDestroySampler(context.device, vk_sampler, nullptr);
-	graphics::destroyTexture(texture);
+	for (const Material& material : materials) {
+		graphics::destroyTexture(material.texture);
+	}
 
 	graphics::destroyBuffer(model_uniform_buffer);
 	graphics::destroyBuffer(spot_light_buffer);
@@ -1104,6 +1128,8 @@ void update(double time) {
 		ImGui::SliderFloat3("Rotation", &selected.rotation.x, -180.0f, 180.0f);
 		ImGui::SliderFloat3("Scale", &selected.scale.x, 0.1f, 10.0f);
 
+		// Доп. задание 1: выбор текстуры для выбранного объекта из выпадающего списка
+		ImGui::Combo("Texture", &selected.texture, texture_names, texture_count);
 		ImGui::ColorEdit3("Specular", &selected.specular.x);
 		ImGui::SliderFloat("Shininess", &selected.shininess, 1.0f, 1024.0f, "%.0f",
 		                   ImGuiSliderFlags_Logarithmic);
@@ -1252,7 +1278,9 @@ void render(const graphics::internal::FrameData& fd) {
 	// Динамический uniform-буфер тоже растёт; тогда в наборе материала переписывается дескриптор
 	if (growBuffer(model_uniform_buffer, model_uniform_capacity, model_uniforms.size(),
 	               model_uniform_stride, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) {
-		writeModelDescriptor(material_descriptor_set);
+		for (const Material& material : materials) {
+			writeModelDescriptor(material.descriptor_set);
+		}
 	}
 
 	// Элемент i лежит по сдвигу i * stride
@@ -1306,22 +1334,23 @@ void render(const graphics::internal::FrameData& fd) {
 	vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_layout,
 	                        0, 1, &scene_descriptor_set, 0, nullptr);
 
-	// Все объекты используют один набор материала, меняется только сдвиг в динамическом буфере
+	// Набор дескрипторов — материал (текстура) объекта, сдвиг — его элемент в динамическом буфере
 	uint32_t index = 0;
 	for (const Object& object : objects) {
 		bindMesh(fd.command_buffer, *object.mesh);
-		bindMaterial(fd.command_buffer, material_descriptor_set, index++);
+		bindMaterial(fd.command_buffer, materials[object.texture].descriptor_set, index++);
 		vkCmdDrawIndexed(fd.command_buffer, object.mesh->index_count, 1, 0, 0, 0);
 	}
 
 	// Визуализация источников: отдельные конвейеры с постоянным цветом, без освещения.
 	// Pipeline layout у всех конвейеров один, поэтому set = 0 остаётся привязанным.
+	// Текстуру эти шейдеры не читают, поэтому подходит набор любого материала.
 	if (show_light_sources) {
 		vkCmdBindPipeline(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_light_pipeline);
 		bindMesh(fd.command_buffer, cube_mesh);
 
 		for (size_t i = 0; i < point_lights.size() + spot_lights.size(); ++i) {
-			bindMaterial(fd.command_buffer, material_descriptor_set, index++);
+			bindMaterial(fd.command_buffer, materials[0].descriptor_set, index++);
 			vkCmdDrawIndexed(fd.command_buffer, cube_mesh.index_count, 1, 0, 0, 0);
 		}
 
@@ -1329,11 +1358,11 @@ void render(const graphics::internal::FrameData& fd) {
 
 		for (size_t i = 0; i < spot_lights.size(); ++i) {
 			bindMesh(fd.command_buffer, cone_mesh);
-			bindMaterial(fd.command_buffer, material_descriptor_set, index++);
+			bindMaterial(fd.command_buffer, materials[0].descriptor_set, index++);
 			vkCmdDrawIndexed(fd.command_buffer, cone_mesh.index_count, 1, 0, 0, 0);
 
 			bindMesh(fd.command_buffer, circle_mesh);
-			bindMaterial(fd.command_buffer, material_descriptor_set, index++);
+			bindMaterial(fd.command_buffer, materials[0].descriptor_set, index++);
 			vkCmdDrawIndexed(fd.command_buffer, circle_mesh.index_count, 1, 0, 0, 0);
 		}
 	}
