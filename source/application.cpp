@@ -81,6 +81,14 @@ const uint32_t icosahedron_indices[] = {
 
 constexpr uint32_t icosahedron_index_count = sizeof(icosahedron_indices) / sizeof(icosahedron_indices[0]);
 
+// Доп. задание 2: флаг и время для нетривиального сэмплирования текстуры. Передаются
+// push-константами прямо в командный буфер перед отрисовкой объекта, а не через
+// uniform-буфер свойств модели.
+struct SamplingConstants {
+	uint32_t enabled; // 0 — обычное чтение текстуры, 1 — нетривиальное сэмплирование
+	float time;       // время в секундах, от него зависит эффект
+};
+
 // Точечный источник в storage-буфере. Раскладка std430 совпадает со struct PointLight
 // в шейдере: vec3 выравнивается на 16 байт, размер структуры 32 байта.
 struct PointLightData {
@@ -185,6 +193,7 @@ struct Object {
 
 	// Материал по модели Блинна-Фонга: альбедо берётся из текстуры
 	int texture; // доп. задание 1: индекс текстуры (материала) из списка
+	bool texture_effect; // доп. задание 2: включено ли нетривиальное сэмплирование
 	math::Vector3 specular;
 	float shininess;
 };
@@ -194,7 +203,7 @@ constexpr int object_count = 4;
 // Три икосаэдра из ЛР1 и пол (квадрат 2x2, растянутый в 8 раз)
 Object objects[object_count] = {
 	{ .mesh = &icosahedron_mesh, .animated = true, .scale = { 0.6f, 0.6f, 0.6f },
-	  .texture = 0, .specular = { 0.5f, 0.5f, 0.5f }, .shininess = 32.0f },
+	  .texture = 0, .texture_effect = true, .specular = { 0.5f, 0.5f, 0.5f }, .shininess = 32.0f },
 	{ .mesh = &icosahedron_mesh, .animated = true, .scale = { 0.6f, 0.6f, 0.6f },
 	  .texture = 2, .specular = { 1.0f, 1.0f, 1.0f }, .shininess = 128.0f },
 	{ .mesh = &icosahedron_mesh, .animated = true, .scale = { 0.6f, 0.6f, 0.6f },
@@ -204,6 +213,8 @@ Object objects[object_count] = {
 };
 
 int selected_object = 0;
+
+float effect_time = 0.0f; // доп. задание 2: время для эффекта, идёт всегда, даже на паузе анимации
 
 SceneUniforms scene_uniforms;
 graphics::Buffer scene_uniform_buffer;
@@ -853,10 +864,19 @@ bool createPipelines() {
 		vk_material_set_layout,
 	};
 
+	// Доп. задание 2: диапазон push-констант для фрагментного шейдера (8 байт)
+	const VkPushConstantRange push_constant_range = {
+		.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+		.offset = 0,
+		.size = sizeof(SamplingConstants),
+	};
+
 	const VkPipelineLayoutCreateInfo pipeline_layout = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
 		.setLayoutCount = sizeof(set_layouts) / sizeof(set_layouts[0]),
 		.pSetLayouts = set_layouts,
+		.pushConstantRangeCount = 1,
+		.pPushConstantRanges = &push_constant_range,
 	};
 
 	if (vkCreatePipelineLayout(context.device, &pipeline_layout, nullptr,
@@ -1130,6 +1150,9 @@ void update(double time) {
 
 		// Доп. задание 1: выбор текстуры для выбранного объекта из выпадающего списка
 		ImGui::Combo("Texture", &selected.texture, texture_names, texture_count);
+
+		// Доп. задание 2: включение нетривиального сэмплирования для выбранного объекта
+		ImGui::Checkbox("Animated texture", &selected.texture_effect);
 		ImGui::ColorEdit3("Specular", &selected.specular.x);
 		ImGui::SliderFloat("Shininess", &selected.shininess, 1.0f, 1024.0f, "%.0f",
 		                   ImGuiSliderFlags_Logarithmic);
@@ -1147,6 +1170,8 @@ void update(double time) {
 	ImGui::End();
 
 	moveCamera(delta_time);
+
+	effect_time = float(time);
 
 	if (animation_playing) {
 		animation_time += delta_time * animation_speed;
@@ -1339,6 +1364,15 @@ void render(const graphics::internal::FrameData& fd) {
 	for (const Object& object : objects) {
 		bindMesh(fd.command_buffer, *object.mesh);
 		bindMaterial(fd.command_buffer, materials[object.texture].descriptor_set, index++);
+
+		// Доп. задание 2: флаг эффекта и время записываются в командный буфер перед отрисовкой
+		const SamplingConstants constants = {
+			.enabled = object.texture_effect ? 1u : 0u,
+			.time = effect_time,
+		};
+		vkCmdPushConstants(fd.command_buffer, vk_pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+		                   sizeof(constants), &constants);
+
 		vkCmdDrawIndexed(fd.command_buffer, object.mesh->index_count, 1, 0, 0, 0);
 	}
 

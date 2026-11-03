@@ -28,6 +28,38 @@ layout(std140, set = 1, binding = 0) uniform ModelUniform {
 // Текстура альбедо вместе с сэмплером (combined image sampler)
 layout(set = 1, binding = 1) uniform sampler2D albedo_texture;
 
+// Доп. задание 2: включение нетривиального сэмплирования и время приходят в push-константах
+layout(push_constant) uniform SamplingConstants {
+	uint enabled;
+	float time;
+} sampling;
+
+// Доп. задание 2: нетривиальное сэмплирование. Та же текстура читается дважды с разными
+// текстурными координатами (первая выборка ползёт по u, вторая повёрнута и уменьшена вдвое),
+// выборки смешиваются, а результат умножается на цвет, плавно меняющий оттенок.
+// Всё зависит от времени, поэтому картинка на объекте постоянно движется.
+vec3 sampleAlbedo(vec2 uv) {
+	if (sampling.enabled == 0) {
+		return texture(albedo_texture, uv).rgb;
+	}
+
+	float t = sampling.time;
+
+	vec2 uv1 = uv + vec2(0.2 * t, 0.0);
+
+	float c = cos(0.5 * t);
+	float s = sin(0.5 * t);
+	vec2 uv2 = mat2(c, s, -s, c) * (uv - 0.5) * 2.0 + 0.5;
+
+	vec3 first = texture(albedo_texture, uv1).rgb;
+	vec3 second = texture(albedo_texture, uv2).rgb;
+	vec3 mixed = mix(first, second, 0.5 + 0.5 * sin(t));
+
+	// Модуляция цвета: каждый канал колеблется со своим сдвигом фазы (0°, 120°, 240°)
+	vec3 tint = 0.6 + 0.4 * cos(t + vec3(0.0, 2.094, 4.189));
+	return mixed * tint;
+}
+
 // Массив точечных источников в storage-буфере (ключевое слово buffer).
 // Размер массива не задаётся: шейдер берёт число источников из point_light_count.
 struct PointLight {
@@ -78,7 +110,7 @@ void main() {
 
 	// Альбедо (Kd) — цвет текстуры в точке с текстурными координатами in_uv.
 	// Текстура в формате SRGB, поэтому texture() сразу возвращает линейный цвет.
-	vec3 albedo = texture(albedo_texture, in_uv).rgb;
+	vec3 albedo = sampleAlbedo(in_uv);
 
 	// Рассеянный свет: Ia * Ka, в качестве Ka берём альбедо
 	vec3 color = scene_uniforms.ambient_light * albedo;
