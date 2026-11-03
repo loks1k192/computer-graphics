@@ -14,12 +14,14 @@ namespace application {
 
 namespace {
 
+// ЛР3: у вершины, кроме позиции и нормали, есть текстурные координаты (u, v)
 struct Vertex {
 	math::Vector3 position;
 	math::Vector3 normal;
+	float uv[2];
 };
 
-// Доп. задание 1: данные разделены на два набора дескрипторов.
+// Данные разделены на два набора дескрипторов.
 // Раскладки по std140 должны совпадать с блоками в шейдерах: vec3 выравнивается
 // на 16 байт, поэтому после vec3 стоят 4 байта выравнивания, а float может
 // поместиться сразу за vec3.
@@ -38,10 +40,13 @@ struct SceneUniforms {
 	uint32_t spot_light_count;                 // 128
 };
 
-// set = 1: матрица модели и материал одного объекта
+// set = 1, binding = 0: свойства одной модели. Свойства всех моделей лежат массивом в одном
+// динамическом uniform-буфере, нужный элемент выбирается сдвигом при привязке набора.
+// Альбедо освещаемых объектов теперь берётся из текстуры, а color — постоянный цвет
+// фигур источников света (они рисуются без текстуры и без освещения).
 struct ModelUniforms {
 	math::Matrix4 model;    // 0
-	math::Vector3 albedo;   // 64
+	math::Vector3 color;    // 64
 	float _pad0;
 	math::Vector3 specular; // 80
 	float alpha;            // 92
@@ -76,8 +81,8 @@ const uint32_t icosahedron_indices[] = {
 
 constexpr uint32_t icosahedron_index_count = sizeof(icosahedron_indices) / sizeof(icosahedron_indices[0]);
 
-// Доп. задание 2: точечный источник в storage-буфере. Раскладка std430 совпадает
-// со struct PointLight в шейдере: vec3 выравнивается на 16 байт, размер структуры 32 байта.
+// Точечный источник в storage-буфере. Раскладка std430 совпадает со struct PointLight
+// в шейдере: vec3 выравнивается на 16 байт, размер структуры 32 байта.
 struct PointLightData {
 	math::Vector3 position; // 0
 	float _pad0;
@@ -92,7 +97,7 @@ struct PointLight {
 	float intensity;
 };
 
-// Доп. задание 3: прожекторный источник в storage-буфере, раскладка std430.
+// Прожекторный источник в storage-буфере, раскладка std430.
 // Вместо углов передаются их косинусы, чтобы не считать cos для каждого пикселя.
 // Размер структуры округляется до кратного 16 (выравнивание vec3), поэтому 64 байта.
 struct SpotLightData {
@@ -116,14 +121,7 @@ struct SpotLight {
 	float outer_angle;
 };
 
-// Доп. задание 4: матрица и цвет фигуры-визуализации источника. Передаются push-константами
-// прямо в командный буфер перед каждой отрисовкой, потому что число источников всё время меняется.
-struct LightMarkerConstants {
-	math::Matrix4 model; // 0
-	float color[4];      // 64
-};
-
-// Геометрия в памяти видеокарты: вершины и индексы одной фигуры
+// Геометрия в памяти видеокарты (VRAM): вершины и индексы одной фигуры
 struct Mesh {
 	graphics::Buffer vertex_buffer;
 	graphics::Buffer index_buffer;
@@ -133,6 +131,8 @@ struct Mesh {
 Mesh icosahedron_mesh;
 Mesh floor_mesh;
 Mesh cube_mesh;
+Mesh cone_mesh;   // конус прожектора из линий: ось, образующие и окружность основания
+Mesh circle_mesh; // окружность внутреннего угла прожектора
 
 constexpr float z_near = 0.1f;
 constexpr float z_far = 100.0f;
@@ -166,6 +166,8 @@ std::vector<SpotLight> spot_lights = {
 	{ { -4.0f, -1.0f, -3.0f }, { 0.6f, 0.6f, 0.5f }, { 0.4f, 1.0f, 0.4f }, 15.0f, 10.0f, 12.0f },
 };
 
+bool show_light_sources = true;
+
 bool animation_playing = true;
 float animation_speed = 1.0f;
 float trajectory_radius = 2.5f;
@@ -181,14 +183,9 @@ struct Object {
 	math::Vector3 rotation;
 	math::Vector3 scale;
 
-	// Материал по модели Блинна-Фонга
-	math::Vector3 albedo;
+	// Материал по модели Блинна-Фонга: альбедо берётся из текстуры
 	math::Vector3 specular;
 	float shininess;
-
-	ModelUniforms uniforms;
-	graphics::Buffer uniform_buffer;
-	VkDescriptorSet descriptor_set;
 };
 
 constexpr int object_count = 4;
@@ -196,13 +193,13 @@ constexpr int object_count = 4;
 // Три икосаэдра из ЛР1 и пол (квадрат 2x2, растянутый в 8 раз)
 Object objects[object_count] = {
 	{ .mesh = &icosahedron_mesh, .animated = true, .scale = { 0.6f, 0.6f, 0.6f },
-	  .albedo = { 0.9f, 0.9f, 0.9f }, .specular = { 1.0f, 1.0f, 1.0f }, .shininess = 32.0f },
+	  .specular = { 1.0f, 1.0f, 1.0f }, .shininess = 32.0f },
 	{ .mesh = &icosahedron_mesh, .animated = true, .scale = { 0.6f, 0.6f, 0.6f },
-	  .albedo = { 0.9f, 0.2f, 0.2f }, .specular = { 1.0f, 1.0f, 1.0f }, .shininess = 128.0f },
+	  .specular = { 1.0f, 1.0f, 1.0f }, .shininess = 128.0f },
 	{ .mesh = &icosahedron_mesh, .animated = true, .scale = { 0.6f, 0.6f, 0.6f },
-	  .albedo = { 0.2f, 0.4f, 0.9f }, .specular = { 0.5f, 0.5f, 0.5f }, .shininess = 8.0f },
+	  .specular = { 0.5f, 0.5f, 0.5f }, .shininess = 8.0f },
 	{ .mesh = &floor_mesh, .animated = false, .position = { 0.0f, 2.0f, 0.0f }, .scale = { 8.0f, 1.0f, 8.0f },
-	  .albedo = { 0.6f, 0.6f, 0.6f }, .specular = { 0.2f, 0.2f, 0.2f }, .shininess = 16.0f },
+	  .specular = { 0.2f, 0.2f, 0.2f }, .shininess = 16.0f },
 };
 
 int selected_object = 0;
@@ -218,36 +215,43 @@ uint32_t point_light_capacity = 4;
 graphics::Buffer spot_light_buffer;
 uint32_t spot_light_capacity = 4;
 
-// Доп. задание 4: конусы прожекторов рисуются линиями, вершины пересчитываются каждый кадр
-bool show_light_sources = true;
-std::vector<Vertex> cone_vertices;
-graphics::Buffer cone_vertex_buffer;
-uint32_t cone_vertex_capacity = 256;
+// Динамический uniform-буфер: массив ModelUniforms, по элементу на каждую отрисовку
+// (объекты, а затем кубы и конусы источников). Элементы лежат с шагом stride, кратным
+// minUniformBufferOffsetAlignment, потому что сдвиг при привязке должен быть ему кратен.
+std::vector<ModelUniforms> model_uniforms;
+graphics::Buffer model_uniform_buffer;
+uint32_t model_uniform_capacity = 16;
+VkDeviceSize model_uniform_stride;
+
+// Текстура альбедо и сэмплер: как читать текстуру (фильтрация, повтор за краями)
+graphics::Texture texture;
+VkSampler vk_sampler;
+
+// set = 1: динамический uniform-буфер свойств моделей и текстура (изображение + сэмплер)
+VkDescriptorSet material_descriptor_set;
 
 VkDescriptorSetLayout vk_scene_set_layout;
-VkDescriptorSetLayout vk_model_set_layout;
+VkDescriptorSetLayout vk_material_set_layout;
 VkDescriptorPool vk_descriptor_pool;
 
+// Один pipeline layout на все три конвейера, поэтому наборы не нужно перепривязывать
 VkPipelineLayout vk_pipeline_layout;
-VkPipeline vk_pipeline;
-
-VkPipelineLayout vk_light_pipeline_layout;
+VkPipeline vk_pipeline;       // освещаемые объекты
 VkPipeline vk_light_pipeline; // кубы источников
 VkPipeline vk_line_pipeline;  // конусы прожекторов
 
+// Вершины и индексы копируются в VRAM через staging-буфер (graphics::createDeviceBuffer)
 bool createMesh(const Vertex vertices[], uint32_t vertex_count,
                 const uint32_t indices[], uint32_t index_count, Mesh& mesh) {
-	if (!graphics::createBuffer(vertex_count * sizeof(Vertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-	                            mesh.vertex_buffer)) {
+	if (!graphics::createDeviceBuffer(vertices, vertex_count * sizeof(Vertex),
+	                                  VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, mesh.vertex_buffer)) {
 		return false;
 	}
-	memcpy(mesh.vertex_buffer.memory, vertices, vertex_count * sizeof(Vertex));
 
-	if (!graphics::createBuffer(index_count * sizeof(uint32_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-	                            mesh.index_buffer)) {
+	if (!graphics::createDeviceBuffer(indices, index_count * sizeof(uint32_t),
+	                                  VK_BUFFER_USAGE_INDEX_BUFFER_BIT, mesh.index_buffer)) {
 		return false;
 	}
-	memcpy(mesh.index_buffer.memory, indices, index_count * sizeof(uint32_t));
 
 	mesh.index_count = index_count;
 	return true;
@@ -258,10 +262,17 @@ void destroyMesh(const Mesh& mesh) {
 	graphics::destroyBuffer(mesh.vertex_buffer);
 }
 
-bool createBuffers() {
-	// Нормали икосаэдра считаются процедурно: нормаль грани — векторное произведение
-	// двух её рёбер. Чтобы у каждой грани была своя нормаль, вершины между гранями
-	// не делятся: 20 граней по 3 вершины.
+bool createMeshes() {
+	// Нормали и текстурные координаты икосаэдра генерируются процедурно. Нормаль грани —
+	// векторное произведение двух её рёбер. На каждую грань (правильный треугольник)
+	// накладывается равносторонний треугольник из текстуры, поэтому картинка не искажается.
+	// Вершины между гранями не делятся: 20 граней по 3 вершины.
+	const float face_uv[3][2] = {
+		{ 0.5f, 0.0f },
+		{ 0.0f, 0.866f },
+		{ 1.0f, 0.866f },
+	};
+
 	Vertex icosahedron_vertices[icosahedron_index_count];
 	uint32_t indices[icosahedron_index_count];
 
@@ -273,9 +284,9 @@ bool createBuffers() {
 		// Обход против часовой стрелки снаружи, поэтому нормаль смотрит наружу
 		const math::Vector3 normal = math::normalize(math::cross(b - a, c - a));
 
-		icosahedron_vertices[i + 0] = { a, normal };
-		icosahedron_vertices[i + 1] = { b, normal };
-		icosahedron_vertices[i + 2] = { c, normal };
+		icosahedron_vertices[i + 0] = { a, normal, { face_uv[0][0], face_uv[0][1] } };
+		icosahedron_vertices[i + 1] = { b, normal, { face_uv[1][0], face_uv[1][1] } };
+		icosahedron_vertices[i + 2] = { c, normal, { face_uv[2][0], face_uv[2][1] } };
 
 		indices[i + 0] = i + 0;
 		indices[i + 1] = i + 1;
@@ -288,11 +299,12 @@ bool createBuffers() {
 	}
 
 	// Пол — квадрат в плоскости y = 0. Ось Y направлена вниз, поэтому нормаль (0, -1, 0).
+	// Текстурные координаты от 0 до 8: при режиме REPEAT текстура повторится 8 раз.
 	const Vertex floor_vertices[] = {
-		{ { -1.0f, 0.0f, -1.0f }, { 0.0f, -1.0f, 0.0f } },
-		{ {  1.0f, 0.0f, -1.0f }, { 0.0f, -1.0f, 0.0f } },
-		{ {  1.0f, 0.0f,  1.0f }, { 0.0f, -1.0f, 0.0f } },
-		{ { -1.0f, 0.0f,  1.0f }, { 0.0f, -1.0f, 0.0f } },
+		{ { -1.0f, 0.0f, -1.0f }, { 0.0f, -1.0f, 0.0f }, { 0.0f, 0.0f } },
+		{ {  1.0f, 0.0f, -1.0f }, { 0.0f, -1.0f, 0.0f }, { 8.0f, 0.0f } },
+		{ {  1.0f, 0.0f,  1.0f }, { 0.0f, -1.0f, 0.0f }, { 8.0f, 8.0f } },
+		{ { -1.0f, 0.0f,  1.0f }, { 0.0f, -1.0f, 0.0f }, { 0.0f, 8.0f } },
 	};
 
 	const uint32_t floor_indices[] = { 0, 1, 2, 0, 2, 3 };
@@ -301,7 +313,7 @@ bool createBuffers() {
 		return false;
 	}
 
-	// Доп. задание 4: куб для визуализации источников. Он не освещается, поэтому нормали не нужны.
+	// Куб для визуализации источников. Он не освещается и не текстурируется.
 	const Vertex cube_vertices[] = {
 		{ { -1.0f, -1.0f, -1.0f } }, { {  1.0f, -1.0f, -1.0f } },
 		{ {  1.0f,  1.0f, -1.0f } }, { { -1.0f,  1.0f, -1.0f } },
@@ -322,10 +334,53 @@ bool createBuffers() {
 		return false;
 	}
 
-	if (!graphics::createBuffer(cone_vertex_capacity * sizeof(Vertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-	                            cone_vertex_buffer)) {
+	// Конус и окружность для прожекторов (топология LINE_LIST, каждая пара индексов — отрезок).
+	// Вершина конуса в (0, 0, 0), ось вдоль +Z, окружность радиуса 1 в плоскости z = 1.
+	// Матрица модели поворачивает ось вдоль направления прожектора и растягивает радиус
+	// до длина * tg(угла), поэтому сами вершины не меняются и лежат в VRAM.
+	const int segments = 16;
+
+	std::vector<Vertex> cone_vertices = { { { 0.0f, 0.0f, 0.0f } }, { { 0.0f, 0.0f, 1.0f } } };
+	std::vector<uint32_t> cone_indices = { 0, 1 };
+	std::vector<Vertex> circle_vertices;
+	std::vector<uint32_t> circle_indices;
+
+	for (int k = 0; k < segments; ++k) {
+		const float angle = 2.0f * math::pi * float(k) / float(segments);
+		const math::Vector3 point = { std::cos(angle), std::sin(angle), 1.0f };
+		const uint32_t next = uint32_t((k + 1) % segments);
+
+		cone_vertices.push_back({ point });
+		circle_vertices.push_back({ point });
+
+		// окружность основания: отрезок к следующей точке
+		cone_indices.push_back(2 + k);
+		cone_indices.push_back(2 + next);
+		circle_indices.push_back(k);
+		circle_indices.push_back(next);
+
+		// 8 образующих: от вершины конуса к каждой второй точке окружности
+		if (k % 2 == 0) {
+			cone_indices.push_back(0);
+			cone_indices.push_back(2 + k);
+		}
+	}
+
+	if (!createMesh(cone_vertices.data(), uint32_t(cone_vertices.size()),
+	                cone_indices.data(), uint32_t(cone_indices.size()), cone_mesh)) {
 		return false;
 	}
+
+	if (!createMesh(circle_vertices.data(), uint32_t(circle_vertices.size()),
+	                circle_indices.data(), uint32_t(circle_indices.size()), circle_mesh)) {
+		return false;
+	}
+
+	return true;
+}
+
+bool createBuffers() {
+	auto& context = graphics::internal::context;
 
 	if (!graphics::createBuffer(sizeof(SceneUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
 	                            scene_uniform_buffer)) {
@@ -342,11 +397,49 @@ bool createBuffers() {
 		return false;
 	}
 
-	for (Object& object : objects) {
-		if (!graphics::createBuffer(sizeof(ModelUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-		                            object.uniform_buffer)) {
-			return false;
-		}
+	// Шаг элементов динамического uniform-буфера: размер ModelUniforms (96 байт),
+	// округлённый вверх до minUniformBufferOffsetAlignment (на Intel Iris Xe — 64, шаг 128)
+	VkPhysicalDeviceProperties properties;
+	vkGetPhysicalDeviceProperties(context.physical_device, &properties);
+	const VkDeviceSize alignment = properties.limits.minUniformBufferOffsetAlignment;
+	model_uniform_stride = (sizeof(ModelUniforms) + alignment - 1) / alignment * alignment;
+
+	if (!graphics::createBuffer(model_uniform_capacity * model_uniform_stride,
+	                            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, model_uniform_buffer)) {
+		return false;
+	}
+
+	return true;
+}
+
+bool createTextures() {
+	auto& context = graphics::internal::context;
+
+	if (!graphics::loadTexture("textures/bricks.png", texture)) {
+		return false;
+	}
+
+	// Линейная фильтрация сглаживает текстуру при увеличении и уменьшении,
+	// REPEAT повторяет текстуру, если координаты выходят за [0, 1]
+	const VkSamplerCreateInfo sampler_info = {
+		.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+		.magFilter = VK_FILTER_LINEAR,
+		.minFilter = VK_FILTER_LINEAR,
+		.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+		.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+		.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+		.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+		.anisotropyEnable = VK_FALSE,
+		.compareEnable = VK_FALSE,
+		.minLod = 0.0f,
+		.maxLod = 0.0f,
+		.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+		.unnormalizedCoordinates = VK_FALSE,
+	};
+
+	if (vkCreateSampler(context.device, &sampler_info, nullptr, &vk_sampler) != VK_SUCCESS) {
+		std::cerr << "Failed to create sampler\n";
+		return false;
 	}
 
 	return true;
@@ -393,6 +486,27 @@ void writeStorageDescriptor(uint32_t binding, const graphics::Buffer& buffer) {
 	vkUpdateDescriptorSets(graphics::internal::context.device, 1, &write, 0, nullptr);
 }
 
+// Записывает в набор материала динамический uniform-буфер свойств моделей.
+// range — размер одного элемента: шейдер видит один ModelUniforms по сдвигу из привязки.
+void writeModelDescriptor(VkDescriptorSet descriptor_set) {
+	const VkDescriptorBufferInfo buffer_descriptor = {
+		.buffer = model_uniform_buffer.buffer,
+		.offset = 0,
+		.range = sizeof(ModelUniforms),
+	};
+
+	const VkWriteDescriptorSet write = {
+		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		.dstSet = descriptor_set,
+		.dstBinding = 0,
+		.descriptorCount = 1,
+		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+		.pBufferInfo = &buffer_descriptor,
+	};
+
+	vkUpdateDescriptorSets(graphics::internal::context.device, 1, &write, 0, nullptr);
+}
+
 bool createDescriptorSets() {
 	auto& context = graphics::internal::context;
 
@@ -431,44 +545,58 @@ bool createDescriptorSets() {
 		return false;
 	}
 
-	// set = 1: uniform-буфер модели. Вершинный шейдер берёт матрицу модели,
-	// фрагментный — материал.
-	const VkDescriptorSetLayoutBinding model_bindings[] = {
+	// set = 1: binding 0 — динамический uniform-буфер со свойствами моделей,
+	// binding 1 — текстура альбедо вместе с сэмплером (combined image sampler)
+	const VkDescriptorSetLayoutBinding material_bindings[] = {
 		{
 			.binding = 0,
-			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
 			.descriptorCount = 1,
 			.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 		},
+		{
+			.binding = 1,
+			.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+			.descriptorCount = 1,
+			.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+		},
 	};
 
-	const VkDescriptorSetLayoutCreateInfo model_set_layout = {
+	const VkDescriptorSetLayoutCreateInfo material_set_layout = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-		.bindingCount = sizeof(model_bindings) / sizeof(model_bindings[0]),
-		.pBindings = model_bindings,
+		.bindingCount = sizeof(material_bindings) / sizeof(material_bindings[0]),
+		.pBindings = material_bindings,
 	};
 
-	if (vkCreateDescriptorSetLayout(context.device, &model_set_layout, nullptr,
-	                                &vk_model_set_layout) != VK_SUCCESS) {
-		std::cerr << "Failed to create model descriptor set layout\n";
+	if (vkCreateDescriptorSetLayout(context.device, &material_set_layout, nullptr,
+	                                &vk_material_set_layout) != VK_SUCCESS) {
+		std::cerr << "Failed to create material descriptor set layout\n";
 		return false;
 	}
 
-	// Один набор сцены и по набору на каждый объект
+	// Один набор сцены и один набор материала на все объекты
 	const VkDescriptorPoolSize descriptor_pool_sizes[] = {
 		{
 			.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-			.descriptorCount = 1 + object_count,
+			.descriptorCount = 1,
 		},
 		{
 			.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
 			.descriptorCount = 2,
 		},
+		{
+			.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+			.descriptorCount = 1,
+		},
+		{
+			.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+			.descriptorCount = 1,
+		},
 	};
 
 	const VkDescriptorPoolCreateInfo descriptor_pool = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-		.maxSets = 1 + object_count,
+		.maxSets = 2,
 		.poolSizeCount = sizeof(descriptor_pool_sizes) / sizeof(descriptor_pool_sizes[0]),
 		.pPoolSizes = descriptor_pool_sizes,
 	};
@@ -514,48 +642,45 @@ bool createDescriptorSets() {
 	writeStorageDescriptor(1, point_light_buffer);
 	writeStorageDescriptor(2, spot_light_buffer);
 
-	for (Object& object : objects) {
-		const VkDescriptorSetAllocateInfo model_set = {
-			.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-			.descriptorPool = vk_descriptor_pool,
-			.descriptorSetCount = 1,
-			.pSetLayouts = &vk_model_set_layout,
-		};
+	const VkDescriptorSetAllocateInfo material_set = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+		.descriptorPool = vk_descriptor_pool,
+		.descriptorSetCount = 1,
+		.pSetLayouts = &vk_material_set_layout,
+	};
 
-		if (vkAllocateDescriptorSets(context.device, &model_set, &object.descriptor_set) != VK_SUCCESS) {
-			std::cerr << "Failed to allocate model descriptor set\n";
-			return false;
-		}
-
-		const VkDescriptorBufferInfo model_buffer_descriptor = {
-			.buffer = object.uniform_buffer.buffer,
-			.offset = 0,
-			.range = sizeof(ModelUniforms),
-		};
-
-		const VkWriteDescriptorSet model_writes[] = {
-			{
-				.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-				.dstSet = object.descriptor_set,
-				.dstBinding = 0,
-				.descriptorCount = 1,
-				.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-				.pBufferInfo = &model_buffer_descriptor,
-			},
-		};
-
-		vkUpdateDescriptorSets(context.device, sizeof(model_writes) / sizeof(model_writes[0]),
-		                       model_writes, 0, nullptr);
+	if (vkAllocateDescriptorSets(context.device, &material_set, &material_descriptor_set) != VK_SUCCESS) {
+		std::cerr << "Failed to allocate material descriptor set\n";
+		return false;
 	}
+
+	writeModelDescriptor(material_descriptor_set);
+
+	// Кортеж изображение-сэмплер: шейдер читает текстуру в раскладке SHADER_READ_ONLY_OPTIMAL
+	const VkDescriptorImageInfo image_descriptor = {
+		.sampler = vk_sampler,
+		.imageView = texture.view,
+		.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	};
+
+	const VkWriteDescriptorSet image_write = {
+		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		.dstSet = material_descriptor_set,
+		.dstBinding = 1,
+		.descriptorCount = 1,
+		.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+		.pImageInfo = &image_descriptor,
+	};
+
+	vkUpdateDescriptorSets(context.device, 1, &image_write, 0, nullptr);
 
 	return true;
 }
 
-// Доп. задание 4: конвейеров теперь три. Они отличаются шейдерами, pipeline layout,
-// топологией (треугольники или линии) и отбрасыванием граней, остальное у них общее.
+// Конвейеров три. Они отличаются шейдерами, топологией (треугольники или линии)
+// и отбрасыванием граней, остальное у них общее.
 bool createPipeline(const char vertex_shader_path[], const char fragment_shader_path[],
-                    VkPipelineLayout layout, VkPrimitiveTopology topology,
-                    VkCullModeFlags cull_mode, VkPipeline& result) {
+                    VkPrimitiveTopology topology, VkCullModeFlags cull_mode, VkPipeline& result) {
 	auto& context = graphics::internal::context;
 
 	VkShaderModule vertex_shader = graphics::loadShaderModule(vertex_shader_path);
@@ -596,6 +721,12 @@ bool createPipeline(const char vertex_shader_path[], const char fragment_shader_
 			.binding = 0,
 			.format = VK_FORMAT_R32G32B32_SFLOAT,
 			.offset = offsetof(Vertex, normal),
+		},
+		{
+			.location = 2,
+			.binding = 0,
+			.format = VK_FORMAT_R32G32_SFLOAT,
+			.offset = offsetof(Vertex, uv),
 		},
 	};
 
@@ -672,7 +803,7 @@ bool createPipeline(const char vertex_shader_path[], const char fragment_shader_
 		.pDepthStencilState = &depth_stencil_state,
 		.pColorBlendState = &color_blend_state,
 		.pDynamicState = &dynamic_state,
-		.layout = layout,
+		.layout = vk_pipeline_layout,
 		.renderPass = context.render_pass,
 		.subpass = 0,
 	};
@@ -697,7 +828,7 @@ bool createPipelines() {
 	// Номер описания в массиве — это номер set в шейдере
 	const VkDescriptorSetLayout set_layouts[] = {
 		vk_scene_set_layout,
-		vk_model_set_layout,
+		vk_material_set_layout,
 	};
 
 	const VkPipelineLayoutCreateInfo pipeline_layout = {
@@ -712,39 +843,17 @@ bool createPipelines() {
 		return false;
 	}
 
-	// Доп. задание 4: визуализации источников нужен только set = 0 (view_projection),
-	// а матрица и цвет фигуры приходят в push-константах
-	const VkPushConstantRange push_constant_range = {
-		.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
-		.offset = 0,
-		.size = sizeof(LightMarkerConstants),
-	};
-
-	const VkPipelineLayoutCreateInfo light_pipeline_layout = {
-		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-		.setLayoutCount = 1,
-		.pSetLayouts = &vk_scene_set_layout,
-		.pushConstantRangeCount = 1,
-		.pPushConstantRanges = &push_constant_range,
-	};
-
-	if (vkCreatePipelineLayout(context.device, &light_pipeline_layout, nullptr,
-	                           &vk_light_pipeline_layout) != VK_SUCCESS) {
-		std::cerr << "Failed to create light pipeline layout\n";
-		return false;
-	}
-
-	if (!createPipeline("shaders/basic.vert.spv", "shaders/basic.frag.spv", vk_pipeline_layout,
+	if (!createPipeline("shaders/basic.vert.spv", "shaders/basic.frag.spv",
 	                    VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_CULL_MODE_BACK_BIT, vk_pipeline)) {
 		return false;
 	}
 
-	if (!createPipeline("shaders/light.vert.spv", "shaders/light.frag.spv", vk_light_pipeline_layout,
+	if (!createPipeline("shaders/light.vert.spv", "shaders/light.frag.spv",
 	                    VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_CULL_MODE_NONE, vk_light_pipeline)) {
 		return false;
 	}
 
-	if (!createPipeline("shaders/light.vert.spv", "shaders/light.frag.spv", vk_light_pipeline_layout,
+	if (!createPipeline("shaders/light.vert.spv", "shaders/light.frag.spv",
 	                    VK_PRIMITIVE_TOPOLOGY_LINE_LIST, VK_CULL_MODE_NONE, vk_line_pipeline)) {
 		return false;
 	}
@@ -758,6 +867,22 @@ math::Vector3 normalizeDirection(math::Vector3 direction) {
 		return { 0.0f, 1.0f, 0.0f };
 	}
 	return math::normalize(direction);
+}
+
+// Матрица поворота, переводящая ось +Z в направление прожектора. Её столбцы —
+// два перпендикулярных оси вектора и само направление.
+math::Matrix4 spotRotation(math::Vector3 direction) {
+	// cross параллельных векторов равен нулю, поэтому для почти вертикальной оси берём другой helper
+	const math::Vector3 helper = std::fabs(direction.y) < 0.99f ? math::Vector3{ 0.0f, 1.0f, 0.0f }
+	                                                            : math::Vector3{ 1.0f, 0.0f, 0.0f };
+	const math::Vector3 side = math::normalize(math::cross(direction, helper));
+	const math::Vector3 up = math::cross(direction, side);
+
+	math::Matrix4 result = math::identity();
+	result.at(0, 0) = side.x;      result.at(1, 0) = side.y;      result.at(2, 0) = side.z;
+	result.at(0, 1) = up.x;        result.at(1, 1) = up.y;        result.at(2, 1) = up.z;
+	result.at(0, 2) = direction.x; result.at(1, 2) = direction.y; result.at(2, 2) = direction.z;
+	return result;
 }
 
 // Движение камеры с клавиатуры: WASD — вперёд/влево/назад/вправо, Q/E — вниз/вверх,
@@ -799,22 +924,31 @@ void moveCamera(float delta_time) {
 	camera_pitch = std::fmin(std::fmax(camera_pitch, -89.0f), 89.0f);
 }
 
-// Доп. задание 4: маленький куб цвета источника в его позиции
-void drawLightCube(VkCommandBuffer command_buffer, math::Vector3 position, math::Vector3 color) {
-	const LightMarkerConstants constants = {
-		.model = math::translation(position.x, position.y, position.z) * math::scale(0.15f, 0.15f, 0.15f),
-		.color = { color.x, color.y, color.z, 1.0f },
-	};
+// Привязывает набор материала со сдвигом на элемент index динамического uniform-буфера
+void bindMaterial(VkCommandBuffer command_buffer, VkDescriptorSet descriptor_set, uint32_t index) {
+	const uint32_t dynamic_offset = uint32_t(index * model_uniform_stride);
+	vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_layout,
+	                        1, 1, &descriptor_set, 1, &dynamic_offset);
+}
 
-	vkCmdPushConstants(command_buffer, vk_light_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
-	                   sizeof(constants), &constants);
-	vkCmdDrawIndexed(command_buffer, cube_mesh.index_count, 1, 0, 0, 0);
+void bindMesh(VkCommandBuffer command_buffer, const Mesh& mesh) {
+	const VkDeviceSize vertex_buffer_offset = 0;
+	vkCmdBindVertexBuffers(command_buffer, 0, 1, &mesh.vertex_buffer.buffer, &vertex_buffer_offset);
+	vkCmdBindIndexBuffer(command_buffer, mesh.index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
 }
 
 } // namespace
 
 bool initialize() {
+	if (!createMeshes()) {
+		return false;
+	}
+
 	if (!createBuffers()) {
+		return false;
+	}
+
+	if (!createTextures()) {
 		return false;
 	}
 
@@ -836,20 +970,22 @@ void shutdown() {
 	vkDestroyPipeline(context.device, vk_line_pipeline, nullptr);
 	vkDestroyPipeline(context.device, vk_light_pipeline, nullptr);
 	vkDestroyPipeline(context.device, vk_pipeline, nullptr);
-	vkDestroyPipelineLayout(context.device, vk_light_pipeline_layout, nullptr);
 	vkDestroyPipelineLayout(context.device, vk_pipeline_layout, nullptr);
 
 	vkDestroyDescriptorPool(context.device, vk_descriptor_pool, nullptr);
-	vkDestroyDescriptorSetLayout(context.device, vk_model_set_layout, nullptr);
+	vkDestroyDescriptorSetLayout(context.device, vk_material_set_layout, nullptr);
 	vkDestroyDescriptorSetLayout(context.device, vk_scene_set_layout, nullptr);
 
-	for (const Object& object : objects) {
-		graphics::destroyBuffer(object.uniform_buffer);
-	}
-	graphics::destroyBuffer(cone_vertex_buffer);
+	vkDestroySampler(context.device, vk_sampler, nullptr);
+	graphics::destroyTexture(texture);
+
+	graphics::destroyBuffer(model_uniform_buffer);
 	graphics::destroyBuffer(spot_light_buffer);
 	graphics::destroyBuffer(point_light_buffer);
 	graphics::destroyBuffer(scene_uniform_buffer);
+
+	destroyMesh(circle_mesh);
+	destroyMesh(cone_mesh);
 	destroyMesh(cube_mesh);
 	destroyMesh(floor_mesh);
 	destroyMesh(icosahedron_mesh);
@@ -860,7 +996,7 @@ void update(double time) {
 	last_time = time;
 
 	ImGui::SetNextWindowSize(ImVec2(420.0f, 640.0f), ImGuiCond_FirstUseEver);
-	ImGui::Begin("Lab 2");
+	ImGui::Begin("Lab 3");
 
 	if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
 		ImGui::SliderFloat3("Position##camera", &camera_position.x, -20.0f, 20.0f);
@@ -891,11 +1027,9 @@ void update(double time) {
 		ImGui::SliderFloat("Intensity##ambient", &ambient_light_intensity, 0.0f, 1.0f);
 	}
 
-	// Доп. задание 4: показать или скрыть фигуры источников
 	ImGui::Checkbox("Show light sources", &show_light_sources);
 
-	// Доп. задание 2: добавление, удаление и параметры точечных источников
-	if (ImGui::CollapsingHeader("Point lights", ImGuiTreeNodeFlags_DefaultOpen)) {
+	if (ImGui::CollapsingHeader("Point lights")) {
 		if (ImGui::Button("Add point light")) {
 			point_lights.push_back({ { 0.0f, 0.5f, 0.0f }, { 1.0f, 1.0f, 1.0f }, 3.0f });
 		}
@@ -924,8 +1058,7 @@ void update(double time) {
 		}
 	}
 
-	// Доп. задание 3: добавление, удаление и параметры прожекторов
-	if (ImGui::CollapsingHeader("Spot lights", ImGuiTreeNodeFlags_DefaultOpen)) {
+	if (ImGui::CollapsingHeader("Spot lights")) {
 		if (ImGui::Button("Add spot light")) {
 			spot_lights.push_back({ { 0.0f, -3.0f, 0.0f }, { 0.0f, 1.0f, 0.0f }, { 1.0f, 1.0f, 1.0f },
 			                        20.0f, 15.0f, 25.0f });
@@ -971,7 +1104,6 @@ void update(double time) {
 		ImGui::SliderFloat3("Rotation", &selected.rotation.x, -180.0f, 180.0f);
 		ImGui::SliderFloat3("Scale", &selected.scale.x, 0.1f, 10.0f);
 
-		ImGui::ColorEdit3("Albedo", &selected.albedo.x);
 		ImGui::ColorEdit3("Specular", &selected.specular.x);
 		ImGui::SliderFloat("Shininess", &selected.shininess, 1.0f, 1024.0f, "%.0f",
 		                   ImGuiSliderFlags_Logarithmic);
@@ -995,7 +1127,7 @@ void update(double time) {
 	}
 
 	// Матрица вида — обратная к матрице камеры C = T(position) * Ry(yaw) * Rx(pitch),
-	// поэтому множители идут в обратном порядке и с противоположными знаками (лекция 4)
+	// поэтому множители идут в обратном порядке и с противоположными знаками
 	const math::Matrix4 view =
 		math::rotationX(-math::radians(camera_pitch)) *
 		math::rotationY(-math::radians(camera_yaw)) *
@@ -1020,8 +1152,13 @@ void update(double time) {
 	scene_uniforms.point_light_count = uint32_t(point_lights.size());
 	scene_uniforms.spot_light_count = uint32_t(spot_lights.size());
 
+	// Свойства всех моделей собираются в один массив. Порядок: объекты, кубы точечных
+	// источников, кубы прожекторов, затем для каждого прожектора конус и окружность.
+	// В render() отрисовки идут в том же порядке, индекс элемента задаёт сдвиг в буфере.
+	model_uniforms.clear();
+
 	for (int i = 0; i < object_count; ++i) {
-		Object& object = objects[i];
+		const Object& object = objects[i];
 
 		math::Vector3 offset = { 0.0f, 0.0f, 0.0f };
 		float t = 0.0f;
@@ -1044,50 +1181,35 @@ void update(double time) {
 			math::rotationX(math::radians(object.rotation.x) + t * 0.5f) *
 			math::scale(object.scale.x, object.scale.y, object.scale.z);
 
-		object.uniforms.model = model;
-		object.uniforms.albedo = object.albedo;
-		object.uniforms.specular = object.specular;
-		object.uniforms.alpha = object.shininess;
+		model_uniforms.push_back({ .model = model, .specular = object.specular, .alpha = object.shininess });
 	}
 
-	// Доп. задание 4: конусы прожекторов из белых линий. Вершины считаются сразу в мировых
-	// координатах: ось конуса, 8 образующих и окружности внешнего и внутреннего углов.
-	cone_vertices.clear();
+	if (show_light_sources) {
+		const math::Matrix4 cube_scale = math::scale(0.15f, 0.15f, 0.15f);
 
-	for (const SpotLight& light : spot_lights) {
-		const math::Vector3 direction = normalizeDirection(light.direction);
+		for (const PointLight& light : point_lights) {
+			const math::Vector3 p = light.position;
+			model_uniforms.push_back({ .model = math::translation(p.x, p.y, p.z) * cube_scale, .color = light.color });
+		}
 
-		// Два вектора, перпендикулярных оси, задают плоскость окружности основания конуса
-		const math::Vector3 helper = std::fabs(direction.y) < 0.99f ? math::Vector3{ 0.0f, 1.0f, 0.0f }
-		                                                            : math::Vector3{ 1.0f, 0.0f, 0.0f };
-		const math::Vector3 side = math::normalize(math::cross(direction, helper));
-		const math::Vector3 up = math::cross(direction, side);
+		for (const SpotLight& light : spot_lights) {
+			const math::Vector3 p = light.position;
+			model_uniforms.push_back({ .model = math::translation(p.x, p.y, p.z) * cube_scale, .color = light.color });
+		}
 
+		// Конус длиной 1.5: радиус основания 1.5 * tg(угла). Цвет линий белый.
 		const float cone_length = 1.5f;
-		const math::Vector3 center = light.position + direction * cone_length;
-		const float outer_radius = cone_length * std::tan(math::radians(light.outer_angle));
-		const float inner_radius = cone_length * std::tan(math::radians(light.inner_angle));
+		for (const SpotLight& light : spot_lights) {
+			const math::Matrix4 placement =
+				math::translation(light.position.x, light.position.y, light.position.z) *
+				spotRotation(normalizeDirection(light.direction));
+			const float outer_radius = cone_length * std::tan(math::radians(light.outer_angle));
+			const float inner_radius = cone_length * std::tan(math::radians(light.inner_angle));
 
-		cone_vertices.push_back({ light.position });
-		cone_vertices.push_back({ center });
-
-		const int segments = 16;
-		for (int k = 0; k < segments; ++k) {
-			const float angle0 = 2.0f * math::pi * float(k) / float(segments);
-			const float angle1 = 2.0f * math::pi * float(k + 1) / float(segments);
-			const math::Vector3 offset0 = side * std::cos(angle0) + up * std::sin(angle0);
-			const math::Vector3 offset1 = side * std::cos(angle1) + up * std::sin(angle1);
-
-			cone_vertices.push_back({ center + offset0 * outer_radius });
-			cone_vertices.push_back({ center + offset1 * outer_radius });
-
-			cone_vertices.push_back({ center + offset0 * inner_radius });
-			cone_vertices.push_back({ center + offset1 * inner_radius });
-
-			if (k % 2 == 0) {
-				cone_vertices.push_back({ light.position });
-				cone_vertices.push_back({ center + offset0 * outer_radius });
-			}
+			model_uniforms.push_back({ .model = placement * math::scale(outer_radius, outer_radius, cone_length),
+			                           .color = { 1.0f, 1.0f, 1.0f } });
+			model_uniforms.push_back({ .model = placement * math::scale(inner_radius, inner_radius, cone_length),
+			                           .color = { 1.0f, 1.0f, 1.0f } });
 		}
 	}
 }
@@ -1097,9 +1219,8 @@ void render(const graphics::internal::FrameData& fd) {
 
 	memcpy(scene_uniform_buffer.memory, &scene_uniforms, sizeof(scene_uniforms));
 
-	// Доп. задание 2: если источников больше, чем помещается в storage-буфер, буфер пересоздаётся
-	// и набор сцены переписывается. Это безопасно: prepare() уже дождался, пока GPU закончит
-	// прошлый кадр, и старый буфер никто не читает.
+	// Если источников больше, чем помещается в storage-буфер, буфер пересоздаётся и набор сцены
+	// переписывается. Это безопасно: prepare() уже дождался, пока GPU закончит прошлый кадр.
 	if (growBuffer(point_light_buffer, point_light_capacity, point_lights.size(),
 	               sizeof(PointLightData), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) {
 		writeStorageDescriptor(1, point_light_buffer);
@@ -1112,7 +1233,6 @@ void render(const graphics::internal::FrameData& fd) {
 		point_light_data[i].color = point_lights[i].color * point_lights[i].intensity;
 	}
 
-	// Доп. задание 3: то же самое для прожекторов
 	if (growBuffer(spot_light_buffer, spot_light_capacity, spot_lights.size(),
 	               sizeof(SpotLightData), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) {
 		writeStorageDescriptor(2, spot_light_buffer);
@@ -1129,15 +1249,16 @@ void render(const graphics::internal::FrameData& fd) {
 		spot_light_data[i].outer_cutoff = std::cos(math::radians(light.outer_angle));
 	}
 
-	// Доп. задание 4: вершины конусов, буфер растёт так же, как storage-буферы
-	if (!cone_vertices.empty()) {
-		growBuffer(cone_vertex_buffer, cone_vertex_capacity, cone_vertices.size(), sizeof(Vertex),
-		           VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-		memcpy(cone_vertex_buffer.memory, cone_vertices.data(), cone_vertices.size() * sizeof(Vertex));
+	// Динамический uniform-буфер тоже растёт; тогда в наборе материала переписывается дескриптор
+	if (growBuffer(model_uniform_buffer, model_uniform_capacity, model_uniforms.size(),
+	               model_uniform_stride, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) {
+		writeModelDescriptor(material_descriptor_set);
 	}
 
-	for (const Object& object : objects) {
-		memcpy(object.uniform_buffer.memory, &object.uniforms, sizeof(object.uniforms));
+	// Элемент i лежит по сдвигу i * stride
+	for (size_t i = 0; i < model_uniforms.size(); ++i) {
+		memcpy(static_cast<char*>(model_uniform_buffer.memory) + i * model_uniform_stride,
+		       &model_uniforms[i], sizeof(ModelUniforms));
 	}
 
 	vkResetCommandBuffer(fd.command_buffer, 0);
@@ -1185,54 +1306,35 @@ void render(const graphics::internal::FrameData& fd) {
 	vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_layout,
 	                        0, 1, &scene_descriptor_set, 0, nullptr);
 
+	// Все объекты используют один набор материала, меняется только сдвиг в динамическом буфере
+	uint32_t index = 0;
 	for (const Object& object : objects) {
-		const VkDeviceSize vertex_buffer_offset = 0;
-		vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &object.mesh->vertex_buffer.buffer,
-		                       &vertex_buffer_offset);
-		vkCmdBindIndexBuffer(fd.command_buffer, object.mesh->index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
-
-		// set = 1 меняется перед каждым объектом, set = 0 при этом остаётся привязанным
-		vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_layout,
-		                        1, 1, &object.descriptor_set, 0, nullptr);
-
+		bindMesh(fd.command_buffer, *object.mesh);
+		bindMaterial(fd.command_buffer, material_descriptor_set, index++);
 		vkCmdDrawIndexed(fd.command_buffer, object.mesh->index_count, 1, 0, 0, 0);
 	}
 
-	// Доп. задание 4: визуализация источников отдельным конвейером без освещения
+	// Визуализация источников: отдельные конвейеры с постоянным цветом, без освещения.
+	// Pipeline layout у всех конвейеров один, поэтому set = 0 остаётся привязанным.
 	if (show_light_sources) {
 		vkCmdBindPipeline(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_light_pipeline);
+		bindMesh(fd.command_buffer, cube_mesh);
 
-		// У этого конвейера другой pipeline layout (с push-константами), поэтому
-		// набор сцены нужно привязать заново
-		vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_light_pipeline_layout,
-		                        0, 1, &scene_descriptor_set, 0, nullptr);
-
-		const VkDeviceSize vertex_buffer_offset = 0;
-		vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &cube_mesh.vertex_buffer.buffer, &vertex_buffer_offset);
-		vkCmdBindIndexBuffer(fd.command_buffer, cube_mesh.index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
-
-		for (const PointLight& light : point_lights) {
-			drawLightCube(fd.command_buffer, light.position, light.color);
+		for (size_t i = 0; i < point_lights.size() + spot_lights.size(); ++i) {
+			bindMaterial(fd.command_buffer, material_descriptor_set, index++);
+			vkCmdDrawIndexed(fd.command_buffer, cube_mesh.index_count, 1, 0, 0, 0);
 		}
 
-		for (const SpotLight& light : spot_lights) {
-			drawLightCube(fd.command_buffer, light.position, light.color);
-		}
+		vkCmdBindPipeline(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_line_pipeline);
 
-		if (!cone_vertices.empty()) {
-			vkCmdBindPipeline(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_line_pipeline);
+		for (size_t i = 0; i < spot_lights.size(); ++i) {
+			bindMesh(fd.command_buffer, cone_mesh);
+			bindMaterial(fd.command_buffer, material_descriptor_set, index++);
+			vkCmdDrawIndexed(fd.command_buffer, cone_mesh.index_count, 1, 0, 0, 0);
 
-			// Вершины конусов уже в мировых координатах, поэтому матрица модели единичная
-			const LightMarkerConstants constants = {
-				.model = math::identity(),
-				.color = { 1.0f, 1.0f, 1.0f, 1.0f },
-			};
-
-			vkCmdPushConstants(fd.command_buffer, vk_light_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
-			                   sizeof(constants), &constants);
-
-			vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &cone_vertex_buffer.buffer, &vertex_buffer_offset);
-			vkCmdDraw(fd.command_buffer, uint32_t(cone_vertices.size()), 1, 0, 0);
+			bindMesh(fd.command_buffer, circle_mesh);
+			bindMaterial(fd.command_buffer, material_descriptor_set, index++);
+			vkCmdDrawIndexed(fd.command_buffer, circle_mesh.index_count, 1, 0, 0, 0);
 		}
 	}
 

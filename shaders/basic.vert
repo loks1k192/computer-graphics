@@ -2,9 +2,11 @@
 
 layout(location = 0) in vec3 in_position;
 layout(location = 1) in vec3 in_normal;
+layout(location = 2) in vec2 in_uv;
 
 layout(location = 0) out vec3 out_world_position;
 layout(location = 1) out vec3 out_normal;
+layout(location = 2) out vec2 out_uv;
 
 layout(std140, set = 0, binding = 0) uniform SceneUniforms {
 	mat4 view_projection;
@@ -16,9 +18,11 @@ layout(std140, set = 0, binding = 0) uniform SceneUniforms {
 	uint spot_light_count;
 } scene_uniforms;
 
+// Свойства модели из динамического uniform-буфера: в шейдере это обычный uniform-блок,
+// а нужный элемент массива выбирается сдвигом при привязке набора дескрипторов
 layout(std140, set = 1, binding = 0) uniform ModelUniform {
 	mat4 model;
-	vec3 albedo;
+	vec3 color;
 	vec3 specular;
 	float alpha;
 } model_uniforms;
@@ -32,4 +36,7 @@ void main() {
 	// сделала бы нормаль не перпендикулярной поверхности.
 	out_world_position = world_position.xyz;
 	out_normal = transpose(inverse(mat3(model_uniforms.model))) * in_normal;
+
+	// Текстурные координаты просто передаются дальше и интерполируются по треугольнику
+	out_uv = in_uv;
 }

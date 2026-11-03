@@ -43,6 +43,13 @@ FetchContent_Declare(
 	GIT_TAG v3.4.0
 )
 
+# Библиотека stb_image для загрузки и декодирования изображений (один заголовочный файл)
+FetchContent_Declare(
+	stb
+	GIT_REPOSITORY https://github.com/nothings/stb.git
+	GIT_TAG d14d46f6b44456eb88beac58cba833a4135d4c89
+)
+
 FetchContent_Declare(
 	imgui
 	GIT_REPOSITORY https://github.com/ocornut/imgui.git
@@ -60,6 +67,7 @@ FetchContent_MakeAvailable(
 	glfw
 	vk-bootstrap
 	VulkanMemoryAllocator
+	stb
 	imgui
 )
 
@@ -70,7 +78,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 	GPUOpen::VulkanMemoryAllocator
 )
 
-target_include_directories(${PROJECT_NAME} PRIVATE ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+target_include_directories(${PROJECT_NAME} PRIVATE ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends ${stb_SOURCE_DIR})
 target_sources(${PROJECT_NAME} PRIVATE
 	${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
 	${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
