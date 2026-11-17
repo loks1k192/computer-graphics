@@ -15,6 +15,8 @@ layout(std140, set = 0, binding = 0) uniform SceneUniforms {
 	uint point_light_count;
 	uint spot_light_count;
 	mat4 sun_shadow_matrix;
+	mat4 spot_shadow_matrix;
+	int shadow_spot_index;
 } scene_uniforms;
 
 layout(std140, set = 1, binding = 0) uniform ModelUniform {
@@ -24,6 +26,14 @@ layout(std140, set = 1, binding = 0) uniform ModelUniform {
 	float alpha;
 } model_uniforms;
 
+// Доп. задание: с точки зрения какого источника рисуется карта (0 — солнце, 1 — прожектор).
+// Диапазон push-констант вершинного шейдера начинается со смещения 8.
+layout(push_constant) uniform ShadowConstants {
+	layout(offset = 8) uint light_index;
+} shadow;
+
 void main() {
-	gl_Position = scene_uniforms.sun_shadow_matrix * model_uniforms.model * vec4(in_position, 1);
+	mat4 light_matrix = shadow.light_index == 0 ? scene_uniforms.sun_shadow_matrix
+	                                            : scene_uniforms.spot_shadow_matrix;
+	gl_Position = light_matrix * model_uniforms.model * vec4(in_position, 1);
 }

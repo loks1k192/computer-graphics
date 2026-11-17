@@ -40,6 +40,8 @@ struct SceneUniforms {
 	uint32_t spot_light_count;                 // 128
 	float _pad3[3];                            // mat4 выравнивается на 16: следующее смещение 144
 	math::Matrix4 sun_shadow_matrix;           // 144: проекция * вид солнца, для карты теней
+	math::Matrix4 spot_shadow_matrix;          // 208: доп. задание, проекция * вид прожектора
+	int32_t shadow_spot_index;                 // 272: какой прожектор отбрасывает тень, -1 — никакой
 };
 
 // set = 1, binding = 0: свойства одной модели. Свойства всех моделей лежат массивом в одном
@@ -89,6 +91,13 @@ constexpr uint32_t icosahedron_index_count = sizeof(icosahedron_indices) / sizeo
 struct SamplingConstants {
 	uint32_t enabled; // 0 — обычное чтение текстуры, 1 — нетривиальное сэмплирование
 	float time;       // время в секундах, от него зависит эффект
+};
+
+// Доп. задание: push-константа вершинного шейдера карты теней — с точки зрения какого
+// источника рисуется карта (0 — солнце, 1 — прожектор). Лежит после SamplingConstants
+// (смещение 8), чтобы диапазоны вершинного и фрагментного шейдеров не пересекались.
+struct ShadowConstants {
+	uint32_t light_index;
 };
 
 // Точечный источник в storage-буфере. Раскладка std430 совпадает со struct PointLight
@@ -172,7 +181,7 @@ std::vector<PointLight> point_lights = {
 };
 
 std::vector<SpotLight> spot_lights = {
-	{ { 0.0f, -3.0f, 0.0f }, { 0.0f, 1.0f, 0.0f }, { 1.0f, 0.95f, 0.8f }, 20.0f, 15.0f, 25.0f },
+	{ { 0.0f, -5.0f, 0.0f }, { 0.0f, 1.0f, 0.0f }, { 1.0f, 0.95f, 0.8f }, 40.0f, 25.0f, 32.0f },
 	{ { -4.0f, -1.0f, -3.0f }, { 0.6f, 0.6f, 0.5f }, { 0.4f, 1.0f, 0.4f }, 15.0f, 10.0f, 12.0f },
 };
 
@@ -266,6 +275,7 @@ constexpr uint32_t shadow_map_size = 2048;
 constexpr VkFormat shadow_map_format = VK_FORMAT_D32_SFLOAT;
 
 graphics::Texture sun_shadow_map;
+graphics::Texture spot_shadow_map; // доп. задание: карта теней прожектора
 
 // Сэмплер со сравнением глубины: вместо значения глубины возвращает результат сравнения
 // глубины фрагмента с глубиной в карте (1 — освещено, 0 — в тени)
@@ -276,6 +286,10 @@ VkSampler vk_shadow_sampler;
 float sun_shadow_area = 20.0f;
 float depth_bias_constant = 1.25f;
 float depth_bias_slope = 1.75f;
+
+// Доп. задание: тень отбрасывает один выбранный прожектор
+bool spot_shadow_enabled = true;
+int shadow_spot = 0;
 
 VkDescriptorSetLayout vk_scene_set_layout;
 VkDescriptorSetLayout vk_material_set_layout;
@@ -503,6 +517,10 @@ bool createShadowResources() {
 		return false;
 	}
 
+	if (!graphics::createDepthTexture(shadow_map_size, shadow_map_size, shadow_map_format, spot_shadow_map)) {
+		return false;
+	}
+
 	// compareEnable + compareOp = LESS: texture() в шейдере сравнивает глубину фрагмента
 	// с глубиной из карты, «глубина фрагмента < глубины в карте» — точка освещена.
 	// Линейная фильтрация усредняет результаты сравнения для 4 соседних текселей,
@@ -625,6 +643,13 @@ bool createDescriptorSets() {
 			.descriptorCount = 1,
 			.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
 		},
+		// Доп. задание: карта теней прожектора с тем же сэмплером сравнения
+		{
+			.binding = 4,
+			.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+			.descriptorCount = 1,
+			.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+		},
 	};
 
 	const VkDescriptorSetLayoutCreateInfo scene_set_layout = {
@@ -684,7 +709,7 @@ bool createDescriptorSets() {
 		},
 		{
 			.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-			.descriptorCount = texture_count + 1, // текстуры материалов + карта теней
+			.descriptorCount = texture_count + 2, // текстуры материалов + две карты теней
 		},
 	};
 
@@ -738,22 +763,41 @@ bool createDescriptorSets() {
 
 	// Карта теней связана с сэмплером сравнения. Шейдер читает её в раскладке
 	// SHADER_READ_ONLY_OPTIMAL: в неё карта переводится барьером после отрисовки.
-	const VkDescriptorImageInfo shadow_map_descriptor = {
-		.sampler = vk_shadow_sampler,
-		.imageView = sun_shadow_map.view,
-		.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	const VkDescriptorImageInfo shadow_map_descriptors[] = {
+		{
+			.sampler = vk_shadow_sampler,
+			.imageView = sun_shadow_map.view,
+			.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		},
+		{
+			.sampler = vk_shadow_sampler,
+			.imageView = spot_shadow_map.view,
+			.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		},
 	};
 
-	const VkWriteDescriptorSet shadow_map_write = {
-		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-		.dstSet = scene_descriptor_set,
-		.dstBinding = 3,
-		.descriptorCount = 1,
-		.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-		.pImageInfo = &shadow_map_descriptor,
+	// binding 3 — карта солнца, binding 4 — карта прожектора
+	const VkWriteDescriptorSet shadow_map_writes[] = {
+		{
+			.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+			.dstSet = scene_descriptor_set,
+			.dstBinding = 3,
+			.descriptorCount = 1,
+			.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+			.pImageInfo = &shadow_map_descriptors[0],
+		},
+		{
+			.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+			.dstSet = scene_descriptor_set,
+			.dstBinding = 4,
+			.descriptorCount = 1,
+			.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+			.pImageInfo = &shadow_map_descriptors[1],
+		},
 	};
 
-	vkUpdateDescriptorSets(context.device, 1, &shadow_map_write, 0, nullptr);
+	vkUpdateDescriptorSets(context.device, sizeof(shadow_map_writes) / sizeof(shadow_map_writes[0]),
+	                       shadow_map_writes, 0, nullptr);
 
 	// Наборы материалов отличаются только текстурой, динамический uniform-буфер у них общий
 	for (Material& material : materials) {
@@ -1082,12 +1126,22 @@ bool createPipelines() {
 		.size = sizeof(SamplingConstants),
 	};
 
+	// Доп. задание: второй диапазон — индекс источника для вершинного шейдера карты теней
+	const VkPushConstantRange push_constant_ranges[] = {
+		push_constant_range,
+		{
+			.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+			.offset = sizeof(SamplingConstants),
+			.size = sizeof(ShadowConstants),
+		},
+	};
+
 	const VkPipelineLayoutCreateInfo pipeline_layout = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
 		.setLayoutCount = sizeof(set_layouts) / sizeof(set_layouts[0]),
 		.pSetLayouts = set_layouts,
-		.pushConstantRangeCount = 1,
-		.pPushConstantRanges = &push_constant_range,
+		.pushConstantRangeCount = sizeof(push_constant_ranges) / sizeof(push_constant_ranges[0]),
+		.pPushConstantRanges = push_constant_ranges,
 	};
 
 	if (vkCreatePipelineLayout(context.device, &pipeline_layout, nullptr,
@@ -1194,8 +1248,11 @@ void bindMesh(VkCommandBuffer command_buffer, const Mesh& mesh) {
 	vkCmdBindIndexBuffer(command_buffer, mesh.index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
 }
 
-// ЛР4: отрисовка карты теней динамическим рендерингом (без VkRenderPass и VkFramebuffer)
-void renderShadowMap(VkCommandBuffer command_buffer, const graphics::Texture& shadow_map) {
+// ЛР4: отрисовка карты теней динамическим рендерингом (без VkRenderPass и VkFramebuffer).
+// light_index: 0 — солнце, 1 — прожектор (доп. задание). Если draw_objects = false, карта
+// только очищается: её всё равно нужно перевести в раскладку для чтения шейдером.
+void renderShadowMap(VkCommandBuffer command_buffer, const graphics::Texture& shadow_map,
+                     uint32_t light_index, bool draw_objects) {
 	const VkImageSubresourceRange depth_range = {
 		.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
 		.baseMipLevel = 0,
@@ -1259,12 +1316,19 @@ void renderShadowMap(VkCommandBuffer command_buffer, const graphics::Texture& sh
 	vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_layout,
 	                        0, 1, &scene_descriptor_set, 0, nullptr);
 
+	// Доп. задание: шейдер выбирает матрицу источника по индексу из push-константы
+	const ShadowConstants constants = { .light_index = light_index };
+	vkCmdPushConstants(command_buffer, vk_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
+	                   sizeof(SamplingConstants), sizeof(constants), &constants);
+
 	// Та же сцена, что и в основном проходе: объекты с теми же элементами динамического буфера.
 	// Фигуры источников в карту теней не рисуются.
-	for (int i = 0; i < object_count; ++i) {
-		bindMesh(command_buffer, *objects[i].mesh);
-		bindMaterial(command_buffer, materials[objects[i].texture].descriptor_set, uint32_t(i));
-		vkCmdDrawIndexed(command_buffer, objects[i].mesh->index_count, 1, 0, 0, 0);
+	if (draw_objects) {
+		for (int i = 0; i < object_count; ++i) {
+			bindMesh(command_buffer, *objects[i].mesh);
+			bindMaterial(command_buffer, materials[objects[i].texture].descriptor_set, uint32_t(i));
+			vkCmdDrawIndexed(command_buffer, objects[i].mesh->index_count, 1, 0, 0, 0);
+		}
 	}
 
 	vkCmdEndRendering(command_buffer);
@@ -1331,6 +1395,7 @@ void shutdown() {
 	vkDestroyDescriptorSetLayout(context.device, vk_scene_set_layout, nullptr);
 
 	vkDestroySampler(context.device, vk_shadow_sampler, nullptr);
+	graphics::destroyTexture(spot_shadow_map);
 	graphics::destroyTexture(sun_shadow_map);
 
 	vkDestroySampler(context.device, vk_sampler, nullptr);
@@ -1391,6 +1456,12 @@ void update(double time) {
 		ImGui::SliderFloat("Sun shadow area", &sun_shadow_area, 4.0f, 60.0f);
 		ImGui::SliderFloat("Bias constant", &depth_bias_constant, 0.0f, 10.0f);
 		ImGui::SliderFloat("Bias slope", &depth_bias_slope, 0.0f, 10.0f);
+
+		// Доп. задание: тень от выбранного прожектора
+		ImGui::Checkbox("Spot light shadow", &spot_shadow_enabled);
+		if (!spot_lights.empty()) {
+			ImGui::SliderInt("Shadow spot light", &shadow_spot, 0, int(spot_lights.size()) - 1);
+		}
 	}
 
 	ImGui::Checkbox("Show light sources", &show_light_sources);
@@ -1542,6 +1613,30 @@ void update(double time) {
 		math::orthographic(sun_shadow_area, sun_shadow_area, 0.1f, 2.0f * sun_distance) *
 		math::lookAt(sun_position, scene_center, sun_up);
 
+	// Доп. задание: матрица прожектора. Он светит из точки внутри конуса, поэтому проекция
+	// перспективная: угол обзора — весь конус (два внешних угла) с небольшим запасом,
+	// LookAt из позиции прожектора вдоль его направления.
+	if (shadow_spot >= int(spot_lights.size())) {
+		shadow_spot = int(spot_lights.size()) - 1;
+	}
+	if (shadow_spot < 0) {
+		shadow_spot = 0;
+	}
+
+	scene_uniforms.shadow_spot_index = -1;
+	if (spot_shadow_enabled && !spot_lights.empty()) {
+		const SpotLight& light = spot_lights[shadow_spot];
+		const math::Vector3 direction = normalizeDirection(light.direction);
+		const math::Vector3 spot_up = std::fabs(direction.y) < 0.99f ? math::Vector3{ 0.0f, -1.0f, 0.0f }
+		                                                             : math::Vector3{ 0.0f, 0.0f, 1.0f };
+		const float fov = std::fmin(2.0f * light.outer_angle + 5.0f, 170.0f);
+
+		scene_uniforms.spot_shadow_matrix =
+			math::perspective(math::radians(fov), 1.0f, 0.1f, 50.0f) *
+			math::lookAt(light.position, light.position + direction, spot_up);
+		scene_uniforms.shadow_spot_index = shadow_spot;
+	}
+
 	// Свойства всех моделей собираются в один массив. Порядок: объекты, кубы точечных
 	// источников, кубы прожекторов, затем для каждого прожектора конус и окружность.
 	// В render() отрисовки идут в том же порядке, индекс элемента задаёт сдвиг в буфере.
@@ -1662,8 +1757,10 @@ void render(const graphics::internal::FrameData& fd) {
 
 	vkBeginCommandBuffer(fd.command_buffer, &command_buffer_begin);
 
-	// ЛР4: сначала карта теней (своим проходом динамического рендеринга), потом основная сцена
-	renderShadowMap(fd.command_buffer, sun_shadow_map);
+	// ЛР4: сначала карты теней (своими проходами динамического рендеринга), потом основная сцена.
+	// Карта прожектора заполняется, только если его тень включена.
+	renderShadowMap(fd.command_buffer, sun_shadow_map, 0, true);
+	renderShadowMap(fd.command_buffer, spot_shadow_map, 1, scene_uniforms.shadow_spot_index >= 0);
 
 	const VkClearValue clear_values[] = {
 		{ .color = { .float32 = { 0.02f, 0.02f, 0.03f, 1.0f } } },

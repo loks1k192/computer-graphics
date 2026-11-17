@@ -17,6 +17,8 @@ layout(std140, set = 0, binding = 0) uniform SceneUniforms {
 	uint point_light_count;
 	uint spot_light_count;
 	mat4 sun_shadow_matrix; // проекция * вид солнца для карты теней
+	mat4 spot_shadow_matrix; // проекция * вид прожектора, отбрасывающего тень
+	int shadow_spot_index;   // индекс этого прожектора, -1 — тени от прожектора нет
 } scene_uniforms;
 
 // Свойства модели из динамического uniform-буфера: в шейдере это обычный uniform-блок,

@@ -15,6 +15,8 @@ layout(std140, set = 0, binding = 0) uniform SceneUniforms {
 	uint point_light_count;
 	uint spot_light_count;
 	mat4 sun_shadow_matrix; // проекция * вид солнца для карты теней
+	mat4 spot_shadow_matrix; // проекция * вид прожектора, отбрасывающего тень
+	int shadow_spot_index;   // индекс этого прожектора, -1 — тени от прожектора нет
 } scene_uniforms;
 
 // Свойства модели из динамического uniform-буфера: в шейдере это обычный uniform-блок,
@@ -30,6 +32,9 @@ layout(std140, set = 1, binding = 0) uniform ModelUniform {
 // принимает (u, v, глубина фрагмента) и возвращает результат сравнения с глубиной из карты:
 // 1 — фрагмент ближе к солнцу, чем записанная глубина (освещён), 0 — за препятствием (в тени).
 layout(set = 0, binding = 3) uniform sampler2DShadow sun_shadow_map;
+
+// Доп. задание: карта теней прожектора
+layout(set = 0, binding = 4) uniform sampler2DShadow spot_shadow_map;
 
 // Текстура альбедо вместе с сэмплером (combined image sampler)
 layout(set = 1, binding = 1) uniform sampler2D albedo_texture;
@@ -117,8 +122,9 @@ float shadowFactor(sampler2DShadow shadow_map, mat4 light_matrix) {
 	vec3 projected = position.xyz / position.w;
 	vec2 uv = projected.xy * 0.5 + 0.5;
 
-	// Точки вне карты теней считаются освещёнными
-	if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || projected.z > 1.0) {
+	// Точки вне карты теней (и позади источника при перспективной проекции, w <= 0)
+	// считаются освещёнными
+	if (position.w <= 0.0 || uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || projected.z > 1.0) {
 		return 1.0;
 	}
 
@@ -166,6 +172,12 @@ void main() {
 		float cos_angle = dot(-l, spot_lights[i].direction);
 		float edge = max(spot_lights[i].inner_cutoff - spot_lights[i].outer_cutoff, 0.0001);
 		float spot = clamp((cos_angle - spot_lights[i].outer_cutoff) / edge, 0.0, 1.0);
+
+		// Доп. задание: вклад прожектора, отбрасывающего тень, умножается на затенение
+		// из его карты теней (перспективная проекция, поэтому в shadowFactor есть деление на w)
+		if (int(i) == scene_uniforms.shadow_spot_index) {
+			spot *= shadowFactor(spot_shadow_map, scene_uniforms.spot_shadow_matrix);
+		}
 
 		color += blinnPhong(n, v, l, spot_lights[i].color * attenuation * spot, albedo);
 	}
