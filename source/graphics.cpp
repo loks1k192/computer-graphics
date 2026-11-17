@@ -253,6 +253,55 @@ bool loadTexture(const char path[], Texture& result) {
 	return true;
 }
 
+bool createDepthTexture(uint32_t width, uint32_t height, VkFormat format, Texture& result) {
+	auto& context = internal::context;
+
+	const VkImageCreateInfo image_info = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+		.imageType = VK_IMAGE_TYPE_2D,
+		.format = format,
+		.extent = { width, height, 1 },
+		.mipLevels = 1,
+		.arrayLayers = 1,
+		.samples = VK_SAMPLE_COUNT_1_BIT,
+		.tiling = VK_IMAGE_TILING_OPTIMAL,
+		.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+		.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	};
+
+	const VmaAllocationCreateInfo allocation_create_info = {
+		.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+	};
+
+	if (vmaCreateImage(context.allocator, &image_info, &allocation_create_info,
+	                   &result.image, &result.allocation, nullptr) != VK_SUCCESS) {
+		std::cerr << "Failed to create depth image\n";
+		return false;
+	}
+
+	const VkImageViewCreateInfo view_info = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+		.image = result.image,
+		.viewType = VK_IMAGE_VIEW_TYPE_2D,
+		.format = format,
+		.subresourceRange = {
+			.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
+			.baseMipLevel = 0,
+			.levelCount = 1,
+			.baseArrayLayer = 0,
+			.layerCount = 1,
+		},
+	};
+
+	if (vkCreateImageView(context.device, &view_info, nullptr, &result.view) != VK_SUCCESS) {
+		std::cerr << "Failed to create depth image view\n";
+		return false;
+	}
+
+	return true;
+}
+
 void destroyTexture(const Texture& texture) {
 	vkDestroyImageView(internal::context.device, texture.view, nullptr);
 	vmaDestroyImage(internal::context.allocator, texture.image, texture.allocation);

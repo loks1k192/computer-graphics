@@ -38,6 +38,8 @@ struct SceneUniforms {
 	math::Vector3 ambient_light;               // 112
 	uint32_t point_light_count;                // 124
 	uint32_t spot_light_count;                 // 128
+	float _pad3[3];                            // mat4 выравнивается на 16: следующее смещение 144
+	math::Matrix4 sun_shadow_matrix;           // 144: проекция * вид солнца, для карты теней
 };
 
 // set = 1, binding = 0: свойства одной модели. Свойства всех моделей лежат массивом в одном
@@ -81,7 +83,7 @@ const uint32_t icosahedron_indices[] = {
 
 constexpr uint32_t icosahedron_index_count = sizeof(icosahedron_indices) / sizeof(icosahedron_indices[0]);
 
-// Доп. задание 2: флаг и время для нетривиального сэмплирования текстуры. Передаются
+// Флаг и время для нетривиального сэмплирования текстуры. Передаются
 // push-константами прямо в командный буфер перед отрисовкой объекта, а не через
 // uniform-буфер свойств модели.
 struct SamplingConstants {
@@ -159,7 +161,7 @@ float ortho_size = 7.0f;
 // Направленный источник: direction — куда идут лучи
 math::Vector3 directional_light_direction = { 0.4f, 1.0f, 0.6f };
 math::Vector3 directional_light_color = { 1.0f, 0.95f, 0.85f };
-float directional_light_intensity = 0.5f;
+float directional_light_intensity = 0.8f;
 
 math::Vector3 ambient_light_color = { 1.0f, 1.0f, 1.0f };
 float ambient_light_intensity = 0.1f;
@@ -192,8 +194,8 @@ struct Object {
 	math::Vector3 scale;
 
 	// Материал по модели Блинна-Фонга: альбедо берётся из текстуры
-	int texture; // доп. задание 1: индекс текстуры (материала) из списка
-	bool texture_effect; // доп. задание 2: включено ли нетривиальное сэмплирование
+	int texture; // индекс текстуры (материала) из списка
+	bool texture_effect; // включено ли нетривиальное сэмплирование
 	math::Vector3 specular;
 	float shininess;
 };
@@ -214,7 +216,7 @@ Object objects[object_count] = {
 
 int selected_object = 0;
 
-float effect_time = 0.0f; // доп. задание 2: время для эффекта, идёт всегда, даже на паузе анимации
+float effect_time = 0.0f; // время для эффекта, идёт всегда, даже на паузе анимации
 
 SceneUniforms scene_uniforms;
 graphics::Buffer scene_uniform_buffer;
@@ -235,7 +237,7 @@ graphics::Buffer model_uniform_buffer;
 uint32_t model_uniform_capacity = 16;
 VkDeviceSize model_uniform_stride;
 
-// Доп. задание 1: несколько текстур, у каждой (у каждого материала) свой набор дескрипторов
+// Несколько текстур, у каждой (у каждого материала) свой набор дескрипторов
 // set = 1: динамический uniform-буфер свойств моделей (общий) и своя текстура
 struct Material {
 	graphics::Texture texture;
@@ -258,6 +260,23 @@ Material materials[texture_count];
 // Сэмплер общий для всех текстур: как читать текстуру (фильтрация, повтор за краями)
 VkSampler vk_sampler;
 
+// ЛР4: карта теней — изображение глубины сцены с точки зрения солнца.
+// Рисуется каждый кадр динамическим рендерингом, затем читается в основном фрагментном шейдере.
+constexpr uint32_t shadow_map_size = 2048;
+constexpr VkFormat shadow_map_format = VK_FORMAT_D32_SFLOAT;
+
+graphics::Texture sun_shadow_map;
+
+// Сэмплер со сравнением глубины: вместо значения глубины возвращает результат сравнения
+// глубины фрагмента с глубиной в карте (1 — освещено, 0 — в тени)
+VkSampler vk_shadow_sampler;
+
+// Параметры тени из интерфейса: сторона квадрата, который покрывает ортографическая
+// проекция солнца, и сдвиг глубины (depth bias) против «теневых прыщей» (shadow acne)
+float sun_shadow_area = 20.0f;
+float depth_bias_constant = 1.25f;
+float depth_bias_slope = 1.75f;
+
 VkDescriptorSetLayout vk_scene_set_layout;
 VkDescriptorSetLayout vk_material_set_layout;
 VkDescriptorPool vk_descriptor_pool;
@@ -267,6 +286,7 @@ VkPipelineLayout vk_pipeline_layout;
 VkPipeline vk_pipeline;       // освещаемые объекты
 VkPipeline vk_light_pipeline; // кубы источников
 VkPipeline vk_line_pipeline;  // конусы прожекторов
+VkPipeline vk_shadow_pipeline; // ЛР4: карта теней, динамический рендеринг, только вершинный шейдер
 
 // Вершины и индексы копируются в VRAM через staging-буфер (graphics::createDeviceBuffer)
 bool createMesh(const Vertex vertices[], uint32_t vertex_count,
@@ -475,6 +495,43 @@ bool createTextures() {
 	return true;
 }
 
+// ЛР4: изображение карты теней и сэмплер со сравнением глубины
+bool createShadowResources() {
+	auto& context = graphics::internal::context;
+
+	if (!graphics::createDepthTexture(shadow_map_size, shadow_map_size, shadow_map_format, sun_shadow_map)) {
+		return false;
+	}
+
+	// compareEnable + compareOp = LESS: texture() в шейдере сравнивает глубину фрагмента
+	// с глубиной из карты, «глубина фрагмента < глубины в карте» — точка освещена.
+	// Линейная фильтрация усредняет результаты сравнения для 4 соседних текселей,
+	// поэтому край тени получается мягче. За краем карты — CLAMP_TO_EDGE.
+	const VkSamplerCreateInfo sampler_info = {
+		.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+		.magFilter = VK_FILTER_LINEAR,
+		.minFilter = VK_FILTER_LINEAR,
+		.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+		.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+		.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+		.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+		.anisotropyEnable = VK_FALSE,
+		.compareEnable = VK_TRUE,
+		.compareOp = VK_COMPARE_OP_LESS,
+		.minLod = 0.0f,
+		.maxLod = 0.0f,
+		.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE,
+		.unnormalizedCoordinates = VK_FALSE,
+	};
+
+	if (vkCreateSampler(context.device, &sampler_info, nullptr, &vk_shadow_sampler) != VK_SUCCESS) {
+		std::cerr << "Failed to create shadow sampler\n";
+		return false;
+	}
+
+	return true;
+}
+
 // Если элементов стало больше, чем помещается в буфер, создаём новый буфер в 2 раза больше.
 // Возвращает true, если буфер был пересоздан.
 bool growBuffer(graphics::Buffer& buffer, uint32_t& capacity, size_t count,
@@ -561,6 +618,13 @@ bool createDescriptorSets() {
 			.descriptorCount = 1,
 			.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
 		},
+		// ЛР4: карта теней солнца вместе с сэмплером сравнения (в шейдере sampler2DShadow)
+		{
+			.binding = 3,
+			.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+			.descriptorCount = 1,
+			.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+		},
 	};
 
 	const VkDescriptorSetLayoutCreateInfo scene_set_layout = {
@@ -620,7 +684,7 @@ bool createDescriptorSets() {
 		},
 		{
 			.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-			.descriptorCount = texture_count,
+			.descriptorCount = texture_count + 1, // текстуры материалов + карта теней
 		},
 	};
 
@@ -671,6 +735,25 @@ bool createDescriptorSets() {
 
 	writeStorageDescriptor(1, point_light_buffer);
 	writeStorageDescriptor(2, spot_light_buffer);
+
+	// Карта теней связана с сэмплером сравнения. Шейдер читает её в раскладке
+	// SHADER_READ_ONLY_OPTIMAL: в неё карта переводится барьером после отрисовки.
+	const VkDescriptorImageInfo shadow_map_descriptor = {
+		.sampler = vk_shadow_sampler,
+		.imageView = sun_shadow_map.view,
+		.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	};
+
+	const VkWriteDescriptorSet shadow_map_write = {
+		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		.dstSet = scene_descriptor_set,
+		.dstBinding = 3,
+		.descriptorCount = 1,
+		.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+		.pImageInfo = &shadow_map_descriptor,
+	};
+
+	vkUpdateDescriptorSets(context.device, 1, &shadow_map_write, 0, nullptr);
 
 	// Наборы материалов отличаются только текстурой, динамический uniform-буфер у них общий
 	for (Material& material : materials) {
@@ -855,6 +938,134 @@ bool createPipeline(const char vertex_shader_path[], const char fragment_shader_
 	return true;
 }
 
+// ЛР4: конвейер карты теней. Рисует без VkRenderPass и VkFramebuffer (динамический рендеринг):
+// вместо render pass в конвейере указан формат вложения глубины (VkPipelineRenderingCreateInfo).
+// Шейдер только вершинный — он проецирует геометрию с точки зрения источника, а записывается
+// только глубина, поэтому фрагментный шейдер и цветовые вложения не нужны.
+bool createShadowPipeline() {
+	auto& context = graphics::internal::context;
+
+	VkShaderModule vertex_shader = graphics::loadShaderModule("shaders/shadow.vert.spv");
+
+	const VkPipelineShaderStageCreateInfo stage = {
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+		.stage = VK_SHADER_STAGE_VERTEX_BIT,
+		.module = vertex_shader,
+		.pName = "main",
+	};
+
+	const VkVertexInputBindingDescription vertex_binding = {
+		.binding = 0,
+		.stride = sizeof(Vertex),
+		.inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+	};
+
+	// Для тени нужна только позиция вершины
+	const VkVertexInputAttributeDescription vertex_attribute = {
+		.location = 0,
+		.binding = 0,
+		.format = VK_FORMAT_R32G32B32_SFLOAT,
+		.offset = offsetof(Vertex, position),
+	};
+
+	const VkPipelineVertexInputStateCreateInfo vertex_input_state = {
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+		.vertexBindingDescriptionCount = 1,
+		.pVertexBindingDescriptions = &vertex_binding,
+		.vertexAttributeDescriptionCount = 1,
+		.pVertexAttributeDescriptions = &vertex_attribute,
+	};
+
+	const VkPipelineInputAssemblyStateCreateInfo input_assembly_state = {
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+		.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+	};
+
+	const VkPipelineViewportStateCreateInfo viewport_state = {
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+		.viewportCount = 1,
+		.scissorCount = 1,
+	};
+
+	// depthBiasEnable: к глубине каждого треугольника добавляется сдвиг
+	// constant * (минимальный шаг глубины) + slope * (наклон треугольника)
+	const VkPipelineRasterizationStateCreateInfo rasterization_state = {
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+		.polygonMode = VK_POLYGON_MODE_FILL,
+		.cullMode = VK_CULL_MODE_NONE,
+		.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+		.depthBiasEnable = VK_TRUE,
+		.lineWidth = 1.0f,
+	};
+
+	const VkPipelineMultisampleStateCreateInfo multisample_state = {
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+		.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+	};
+
+	const VkPipelineDepthStencilStateCreateInfo depth_stencil_state = {
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+		.depthTestEnable = VK_TRUE,
+		.depthWriteEnable = VK_TRUE,
+		.depthCompareOp = VK_COMPARE_OP_LESS,
+	};
+
+	// Цветовых вложений нет
+	const VkPipelineColorBlendStateCreateInfo color_blend_state = {
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+		.attachmentCount = 0,
+	};
+
+	// Сдвиг глубины задаётся командой vkCmdSetDepthBias, чтобы менять его из интерфейса
+	const VkDynamicState dynamic_states[] = {
+		VK_DYNAMIC_STATE_VIEWPORT,
+		VK_DYNAMIC_STATE_SCISSOR,
+		VK_DYNAMIC_STATE_DEPTH_BIAS,
+	};
+
+	const VkPipelineDynamicStateCreateInfo dynamic_state = {
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+		.dynamicStateCount = sizeof(dynamic_states) / sizeof(dynamic_states[0]),
+		.pDynamicStates = dynamic_states,
+	};
+
+	// Динамический рендеринг: формат вложения глубины вместо render pass
+	const VkPipelineRenderingCreateInfo rendering_info = {
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+		.colorAttachmentCount = 0,
+		.depthAttachmentFormat = shadow_map_format,
+	};
+
+	const VkGraphicsPipelineCreateInfo pipeline = {
+		.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+		.pNext = &rendering_info,
+		.stageCount = 1,
+		.pStages = &stage,
+		.pVertexInputState = &vertex_input_state,
+		.pInputAssemblyState = &input_assembly_state,
+		.pViewportState = &viewport_state,
+		.pRasterizationState = &rasterization_state,
+		.pMultisampleState = &multisample_state,
+		.pDepthStencilState = &depth_stencil_state,
+		.pColorBlendState = &color_blend_state,
+		.pDynamicState = &dynamic_state,
+		.layout = vk_pipeline_layout,
+		.renderPass = VK_NULL_HANDLE,
+	};
+
+	const VkResult status = vkCreateGraphicsPipelines(context.device, VK_NULL_HANDLE, 1, &pipeline,
+	                                                  nullptr, &vk_shadow_pipeline);
+
+	vkDestroyShaderModule(context.device, vertex_shader, nullptr);
+
+	if (status != VK_SUCCESS) {
+		std::cerr << "Failed to create shadow pipeline\n";
+		return false;
+	}
+
+	return true;
+}
+
 bool createPipelines() {
 	auto& context = graphics::internal::context;
 
@@ -864,7 +1075,7 @@ bool createPipelines() {
 		vk_material_set_layout,
 	};
 
-	// Доп. задание 2: диапазон push-констант для фрагментного шейдера (8 байт)
+	// Диапазон push-констант для фрагментного шейдера (8 байт)
 	const VkPushConstantRange push_constant_range = {
 		.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
 		.offset = 0,
@@ -897,6 +1108,10 @@ bool createPipelines() {
 
 	if (!createPipeline("shaders/light.vert.spv", "shaders/light.frag.spv",
 	                    VK_PRIMITIVE_TOPOLOGY_LINE_LIST, VK_CULL_MODE_NONE, vk_line_pipeline)) {
+		return false;
+	}
+
+	if (!createShadowPipeline()) {
 		return false;
 	}
 
@@ -979,6 +1194,98 @@ void bindMesh(VkCommandBuffer command_buffer, const Mesh& mesh) {
 	vkCmdBindIndexBuffer(command_buffer, mesh.index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
 }
 
+// ЛР4: отрисовка карты теней динамическим рендерингом (без VkRenderPass и VkFramebuffer)
+void renderShadowMap(VkCommandBuffer command_buffer, const graphics::Texture& shadow_map) {
+	const VkImageSubresourceRange depth_range = {
+		.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
+		.baseMipLevel = 0,
+		.levelCount = 1,
+		.baseArrayLayer = 0,
+		.layerCount = 1,
+	};
+
+	// Барьер 1: прошлое содержимое не нужно (UNDEFINED), карта становится вложением глубины.
+	// Запись глубины начнётся только после того, как прошлый кадр закончил её читать.
+	const VkImageMemoryBarrier to_attachment = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		.srcAccessMask = 0,
+		.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+		.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+		.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.image = shadow_map.image,
+		.subresourceRange = depth_range,
+	};
+	vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+	                     VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+	                     0, 0, nullptr, 0, nullptr, 1, &to_attachment);
+
+	// Вложение глубины для динамического рендеринга: очистить до 1.0 и сохранить результат
+	const VkRenderingAttachmentInfo depth_attachment = {
+		.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+		.imageView = shadow_map.view,
+		.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+		.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+		.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+		.clearValue = { .depthStencil = { 1.0f, 0 } },
+	};
+
+	const VkRenderingInfo rendering_info = {
+		.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+		.renderArea = { .extent = { shadow_map_size, shadow_map_size } },
+		.layerCount = 1,
+		.colorAttachmentCount = 0,
+		.pDepthAttachment = &depth_attachment,
+	};
+
+	vkCmdBeginRendering(command_buffer, &rendering_info);
+
+	const VkViewport viewport = {
+		.x = 0.0f,
+		.y = 0.0f,
+		.width = float(shadow_map_size),
+		.height = float(shadow_map_size),
+		.minDepth = 0.0f,
+		.maxDepth = 1.0f,
+	};
+	const VkRect2D scissor = { .extent = { shadow_map_size, shadow_map_size } };
+
+	vkCmdSetViewport(command_buffer, 0, 1, &viewport);
+	vkCmdSetScissor(command_buffer, 0, 1, &scissor);
+	vkCmdSetDepthBias(command_buffer, depth_bias_constant, 0.0f, depth_bias_slope);
+
+	vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_shadow_pipeline);
+	vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_layout,
+	                        0, 1, &scene_descriptor_set, 0, nullptr);
+
+	// Та же сцена, что и в основном проходе: объекты с теми же элементами динамического буфера.
+	// Фигуры источников в карту теней не рисуются.
+	for (int i = 0; i < object_count; ++i) {
+		bindMesh(command_buffer, *objects[i].mesh);
+		bindMaterial(command_buffer, materials[objects[i].texture].descriptor_set, uint32_t(i));
+		vkCmdDrawIndexed(command_buffer, objects[i].mesh->index_count, 1, 0, 0, 0);
+	}
+
+	vkCmdEndRendering(command_buffer);
+
+	// Барьер 2: запись глубины закончена, карту будет читать фрагментный шейдер основного прохода
+	const VkImageMemoryBarrier to_shader_read = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+		.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+		.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.image = shadow_map.image,
+		.subresourceRange = depth_range,
+	};
+	vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+	                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+	                     0, 0, nullptr, 0, nullptr, 1, &to_shader_read);
+}
+
 } // namespace
 
 bool initialize() {
@@ -991,6 +1298,10 @@ bool initialize() {
 	}
 
 	if (!createTextures()) {
+		return false;
+	}
+
+	if (!createShadowResources()) {
 		return false;
 	}
 
@@ -1009,6 +1320,7 @@ void shutdown() {
 	auto& context = graphics::internal::context;
 	vkQueueWaitIdle(context.graphics_queue);
 
+	vkDestroyPipeline(context.device, vk_shadow_pipeline, nullptr);
 	vkDestroyPipeline(context.device, vk_line_pipeline, nullptr);
 	vkDestroyPipeline(context.device, vk_light_pipeline, nullptr);
 	vkDestroyPipeline(context.device, vk_pipeline, nullptr);
@@ -1017,6 +1329,9 @@ void shutdown() {
 	vkDestroyDescriptorPool(context.device, vk_descriptor_pool, nullptr);
 	vkDestroyDescriptorSetLayout(context.device, vk_material_set_layout, nullptr);
 	vkDestroyDescriptorSetLayout(context.device, vk_scene_set_layout, nullptr);
+
+	vkDestroySampler(context.device, vk_shadow_sampler, nullptr);
+	graphics::destroyTexture(sun_shadow_map);
 
 	vkDestroySampler(context.device, vk_sampler, nullptr);
 	for (const Material& material : materials) {
@@ -1040,7 +1355,7 @@ void update(double time) {
 	last_time = time;
 
 	ImGui::SetNextWindowSize(ImVec2(420.0f, 640.0f), ImGuiCond_FirstUseEver);
-	ImGui::Begin("Lab 3");
+	ImGui::Begin("Lab 4");
 
 	if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
 		ImGui::SliderFloat3("Position##camera", &camera_position.x, -20.0f, 20.0f);
@@ -1069,6 +1384,13 @@ void update(double time) {
 	if (ImGui::CollapsingHeader("Ambient light", ImGuiTreeNodeFlags_DefaultOpen)) {
 		ImGui::ColorEdit3("Color##ambient", &ambient_light_color.x);
 		ImGui::SliderFloat("Intensity##ambient", &ambient_light_intensity, 0.0f, 1.0f);
+	}
+
+	// ЛР4: площадь, которую покрывает ортографическая проекция солнца, и сдвиг глубины
+	if (ImGui::CollapsingHeader("Shadows", ImGuiTreeNodeFlags_DefaultOpen)) {
+		ImGui::SliderFloat("Sun shadow area", &sun_shadow_area, 4.0f, 60.0f);
+		ImGui::SliderFloat("Bias constant", &depth_bias_constant, 0.0f, 10.0f);
+		ImGui::SliderFloat("Bias slope", &depth_bias_slope, 0.0f, 10.0f);
 	}
 
 	ImGui::Checkbox("Show light sources", &show_light_sources);
@@ -1148,10 +1470,10 @@ void update(double time) {
 		ImGui::SliderFloat3("Rotation", &selected.rotation.x, -180.0f, 180.0f);
 		ImGui::SliderFloat3("Scale", &selected.scale.x, 0.1f, 10.0f);
 
-		// Доп. задание 1: выбор текстуры для выбранного объекта из выпадающего списка
+		// Выбор текстуры для выбранного объекта из выпадающего списка
 		ImGui::Combo("Texture", &selected.texture, texture_names, texture_count);
 
-		// Доп. задание 2: включение нетривиального сэмплирования для выбранного объекта
+		// Включение нетривиального сэмплирования для выбранного объекта
 		ImGui::Checkbox("Animated texture", &selected.texture_effect);
 		ImGui::ColorEdit3("Specular", &selected.specular.x);
 		ImGui::SliderFloat("Shininess", &selected.shininess, 1.0f, 1024.0f, "%.0f",
@@ -1202,6 +1524,23 @@ void update(double time) {
 	scene_uniforms.ambient_light = ambient_light_color * ambient_light_intensity;
 	scene_uniforms.point_light_count = uint32_t(point_lights.size());
 	scene_uniforms.spot_light_count = uint32_t(spot_lights.size());
+
+	// ЛР4: матрица солнца для карты теней. У направленного источника нет позиции, поэтому
+	// «камера» солнца ставится на расстоянии sun_distance от центра сцены против направления лучей
+	// и смотрит на центр (матрица LookAt). Лучи параллельны, поэтому проекция ортографическая:
+	// она покрывает квадрат sun_shadow_area x sun_shadow_area и глубину [0.1, 2 * sun_distance].
+	const float sun_distance = 25.0f;
+	const math::Vector3 scene_center = { 0.0f, 0.0f, 0.0f };
+	const math::Vector3 sun_direction = scene_uniforms.directional_light_direction;
+	const math::Vector3 sun_position = scene_center - sun_direction * sun_distance;
+
+	// «Вверх» не должен совпадать с направлением взгляда: для вертикального солнца берём ось Z
+	const math::Vector3 sun_up = std::fabs(sun_direction.y) < 0.99f ? math::Vector3{ 0.0f, -1.0f, 0.0f }
+	                                                                : math::Vector3{ 0.0f, 0.0f, 1.0f };
+
+	scene_uniforms.sun_shadow_matrix =
+		math::orthographic(sun_shadow_area, sun_shadow_area, 0.1f, 2.0f * sun_distance) *
+		math::lookAt(sun_position, scene_center, sun_up);
 
 	// Свойства всех моделей собираются в один массив. Порядок: объекты, кубы точечных
 	// источников, кубы прожекторов, затем для каждого прожектора конус и окружность.
@@ -1323,6 +1662,9 @@ void render(const graphics::internal::FrameData& fd) {
 
 	vkBeginCommandBuffer(fd.command_buffer, &command_buffer_begin);
 
+	// ЛР4: сначала карта теней (своим проходом динамического рендеринга), потом основная сцена
+	renderShadowMap(fd.command_buffer, sun_shadow_map);
+
 	const VkClearValue clear_values[] = {
 		{ .color = { .float32 = { 0.02f, 0.02f, 0.03f, 1.0f } } },
 		{ .depthStencil = { 1.0f, 0 } },
@@ -1365,7 +1707,7 @@ void render(const graphics::internal::FrameData& fd) {
 		bindMesh(fd.command_buffer, *object.mesh);
 		bindMaterial(fd.command_buffer, materials[object.texture].descriptor_set, index++);
 
-		// Доп. задание 2: флаг эффекта и время записываются в командный буфер перед отрисовкой
+		// Флаг эффекта и время записываются в командный буфер перед отрисовкой
 		const SamplingConstants constants = {
 			.enabled = object.texture_effect ? 1u : 0u,
 			.time = effect_time,

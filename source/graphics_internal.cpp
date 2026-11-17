@@ -389,7 +389,8 @@ Context context;
 bool initialize(GLFWwindow* const window) {
 	vkb::InstanceBuilder ib;
 
-	auto ibr = ib.require_api_version(VK_MAKE_VERSION(1, 1, 0))
+	// ЛР4: динамический рендеринг (dynamic rendering) входит в Vulkan с версии 1.3
+	auto ibr = ib.require_api_version(VK_MAKE_VERSION(1, 3, 0))
 				 .request_validation_layers()
 				 .build();
 
@@ -406,7 +407,13 @@ bool initialize(GLFWwindow* const window) {
 
 	vkb::PhysicalDeviceSelector pds(vkb_instance, vk_surface);
 
+	// ЛР4: карта теней рисуется динамическим рендерингом, эту возможность нужно включить
+	VkPhysicalDeviceVulkan13Features features_13 = {};
+	features_13.dynamicRendering = VK_TRUE;
+
 	auto pds_result = pds.prefer_gpu_device_type(vkb::PreferredDeviceType::discrete)
+						 .set_minimum_version(1, 3)
+						 .set_required_features_13(features_13)
 						 .require_present()
 						 .select();
 	if (!pds_result) {

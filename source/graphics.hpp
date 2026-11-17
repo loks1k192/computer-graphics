@@ -33,6 +33,10 @@ struct Texture {
 bool loadTexture(const char path[], Texture& result);
 void destroyTexture(const Texture& texture);
 
+// Изображение глубины для карты теней: в него рисуют (depth attachment)
+// и из него потом читает шейдер (sampled)
+bool createDepthTexture(uint32_t width, uint32_t height, VkFormat format, Texture& result);
+
 VkShaderModule loadShaderModule(const char path[]);
 
 } // namespace graphics

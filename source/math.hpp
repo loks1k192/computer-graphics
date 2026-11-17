@@ -160,4 +160,22 @@ inline Matrix4 orthographic(float width, float height, float z_near, float z_far
 	return result;
 }
 
+// Матрица вида LookAt: наблюдатель в точке eye смотрит на точку target.
+// Строит оси системы координат наблюдателя: z — вперёд (на target), x — вправо,
+// y — вниз (как у нас принято, ось Y экрана направлена вниз). up — направление «вверх»
+// в мире, оно не должно быть параллельно направлению взгляда.
+// Матрица — обратная к матрице «камеры» с осями x, y, z в точке eye: в строках оси,
+// в последнем столбце сдвиг на -eye, записанный в осях наблюдателя.
+inline Matrix4 lookAt(Vector3 eye, Vector3 target, Vector3 up) {
+	const Vector3 z = normalize(target - eye);
+	const Vector3 x = normalize(cross(z, up));
+	const Vector3 y = cross(z, x);
+
+	Matrix4 result = identity();
+	result.at(0, 0) = x.x; result.at(0, 1) = x.y; result.at(0, 2) = x.z; result.at(0, 3) = -dot(x, eye);
+	result.at(1, 0) = y.x; result.at(1, 1) = y.y; result.at(1, 2) = y.z; result.at(1, 3) = -dot(y, eye);
+	result.at(2, 0) = z.x; result.at(2, 1) = z.y; result.at(2, 2) = z.z; result.at(2, 3) = -dot(z, eye);
+	return result;
+}
+
 } // namespace math

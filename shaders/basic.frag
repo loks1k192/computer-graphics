@@ -14,6 +14,7 @@ layout(std140, set = 0, binding = 0) uniform SceneUniforms {
 	vec3 ambient_light;
 	uint point_light_count;
 	uint spot_light_count;
+	mat4 sun_shadow_matrix; // проекция * вид солнца для карты теней
 } scene_uniforms;
 
 // Свойства модели из динамического uniform-буфера: в шейдере это обычный uniform-блок,
@@ -25,16 +26,21 @@ layout(std140, set = 1, binding = 0) uniform ModelUniform {
 	float alpha;
 } model_uniforms;
 
+// ЛР4: карта теней солнца вместе с сэмплером сравнения глубины. texture() для sampler2DShadow
+// принимает (u, v, глубина фрагмента) и возвращает результат сравнения с глубиной из карты:
+// 1 — фрагмент ближе к солнцу, чем записанная глубина (освещён), 0 — за препятствием (в тени).
+layout(set = 0, binding = 3) uniform sampler2DShadow sun_shadow_map;
+
 // Текстура альбедо вместе с сэмплером (combined image sampler)
 layout(set = 1, binding = 1) uniform sampler2D albedo_texture;
 
-// Доп. задание 2: включение нетривиального сэмплирования и время приходят в push-константах
+// Включение нетривиального сэмплирования и время приходят в push-константах
 layout(push_constant) uniform SamplingConstants {
 	uint enabled;
 	float time;
 } sampling;
 
-// Доп. задание 2: нетривиальное сэмплирование. Та же текстура читается дважды с разными
+// Нетривиальное сэмплирование. Та же текстура читается дважды с разными
 // текстурными координатами (первая выборка ползёт по u, вторая повёрнута и уменьшена вдвое),
 // выборки смешиваются, а результат умножается на цвет, плавно меняющий оттенок.
 // Всё зависит от времени, поэтому картинка на объекте постоянно движется.
@@ -103,6 +109,22 @@ vec3 blinnPhong(vec3 n, vec3 v, vec3 l, vec3 light, vec3 albedo) {
 	return light * (diffuse + specular);
 }
 
+// ЛР4: «затенение» точки: 1 — освещена, 0 — в тени, между ними — на мягком краю.
+// Точка переводится матрицей источника в его пространство отсечения, после деления на w
+// x, y в [-1, 1] переводятся в текстурные координаты [0, 1], а z — глубина для сравнения.
+float shadowFactor(sampler2DShadow shadow_map, mat4 light_matrix) {
+	vec4 position = light_matrix * vec4(in_world_position, 1.0);
+	vec3 projected = position.xyz / position.w;
+	vec2 uv = projected.xy * 0.5 + 0.5;
+
+	// Точки вне карты теней считаются освещёнными
+	if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || projected.z > 1.0) {
+		return 1.0;
+	}
+
+	return texture(shadow_map, vec3(uv, projected.z));
+}
+
 void main() {
 	// После интерполяции длина нормали уже не равна 1
 	vec3 n = normalize(in_normal);
@@ -115,9 +137,11 @@ void main() {
 	// Рассеянный свет: Ia * Ka, в качестве Ka берём альбедо
 	vec3 color = scene_uniforms.ambient_light * albedo;
 
-	// Лучи направленного источника идут вдоль direction, а l — направление на источник
-	color += blinnPhong(n, v, -scene_uniforms.directional_light_direction,
-	                    scene_uniforms.directional_light_color, albedo);
+	// Лучи направленного источника идут вдоль direction, а l — направление на источник.
+	// ЛР4: вклад солнца умножается на затенение из карты теней.
+	float sun_shadow = shadowFactor(sun_shadow_map, scene_uniforms.sun_shadow_matrix);
+	color += sun_shadow * blinnPhong(n, v, -scene_uniforms.directional_light_direction,
+	                                 scene_uniforms.directional_light_color, albedo);
 
 	for (uint i = 0; i < scene_uniforms.point_light_count; ++i) {
 		vec3 to_light = point_lights[i].position - in_world_position;
