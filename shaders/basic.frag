@@ -119,12 +119,15 @@ vec3 blinnPhong(vec3 n, vec3 v, vec3 l, vec3 light, vec3 albedo) {
 // x, y в [-1, 1] переводятся в текстурные координаты [0, 1], а z — глубина для сравнения.
 float shadowFactor(sampler2DShadow shadow_map, mat4 light_matrix) {
 	vec4 position = light_matrix * vec4(in_world_position, 1.0);
+	if (position.w <= 0.0) {
+		return 1.0;
+	}
 	vec3 projected = position.xyz / position.w;
 	vec2 uv = projected.xy * 0.5 + 0.5;
 
 	// Точки вне карты теней (и позади источника при перспективной проекции, w <= 0)
 	// считаются освещёнными
-	if (position.w <= 0.0 || uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || projected.z > 1.0) {
+	if (projected.z < 0.0 || uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || projected.z > 1.0) {
 		return 1.0;
 	}
 

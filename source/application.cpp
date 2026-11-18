@@ -894,7 +894,8 @@ bool createPipeline(const char vertex_shader_path[], const char fragment_shader_
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
 		.vertexBindingDescriptionCount = sizeof(vertex_bindings) / sizeof(vertex_bindings[0]),
 		.pVertexBindingDescriptions = vertex_bindings,
-		.vertexAttributeDescriptionCount = sizeof(vertex_attributes) / sizeof(vertex_attributes[0]),
+		.vertexAttributeDescriptionCount = (topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || cull_mode == VK_CULL_MODE_NONE)
+		                                  ? 1u : uint32_t(sizeof(vertex_attributes) / sizeof(vertex_attributes[0])),
 		.pVertexAttributeDescriptions = vertex_attributes,
 	};
 
@@ -1345,7 +1346,8 @@ void renderShadowMap(VkCommandBuffer command_buffer, const graphics::Texture& sh
 		.image = shadow_map.image,
 		.subresourceRange = depth_range,
 	};
-	vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+	vkCmdPipelineBarrier(command_buffer,
+	                     VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
 	                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 	                     0, 0, nullptr, 0, nullptr, 1, &to_shader_read);
 }

@@ -26,6 +26,7 @@ namespace graphics::internal {
 namespace {
 
 VkInstance vk_instance;
+VkDebugUtilsMessengerEXT vk_debug_messenger;
 uint32_t vk_api_version;
 VkSurfaceKHR vk_surface;
 
@@ -392,10 +393,12 @@ bool initialize(GLFWwindow* const window) {
 	// ЛР4: динамический рендеринг (dynamic rendering) входит в Vulkan с версии 1.3
 	auto ibr = ib.require_api_version(VK_MAKE_VERSION(1, 3, 0))
 				 .request_validation_layers()
+				 .use_default_debug_messenger()
 				 .build();
 
 	auto vkb_instance = ibr.value();
 	vk_instance = vkb_instance.instance;
+	vk_debug_messenger = vkb_instance.debug_messenger;
 	vk_api_version = vkb_instance.api_version;
 
 	if (glfwCreateWindowSurface(vk_instance, window, nullptr, &vk_surface) != VK_SUCCESS) {
@@ -584,12 +587,24 @@ bool initialize(GLFWwindow* const window) {
 		.pDepthStencilAttachment = &render_pass_depth_attachment,
 	};
 
+	// Переход swapchain из UNDEFINED выполняется после ожидания image_available.
+	const VkSubpassDependency scene_dependency = {
+		.srcSubpass = VK_SUBPASS_EXTERNAL,
+		.dstSubpass = 0,
+		.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+		.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+		.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+		.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+	};
+
 	const VkRenderPassCreateInfo render_pass = {
 		.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
 		.attachmentCount = sizeof(render_pass_attachments) / sizeof(render_pass_attachments[0]),
 		.pAttachments = render_pass_attachments,
 		.subpassCount = 1,
 		.pSubpasses = &render_pass_subpass,
+		.dependencyCount = 1,
+		.pDependencies = &scene_dependency,
 	};
 
 	if (vkCreateRenderPass(context.device, &render_pass, nullptr, &context.render_pass) != VK_SUCCESS) {
@@ -721,6 +736,7 @@ void shutdown() {
 	vkDestroyDevice(context.device, nullptr);
 
 	vkDestroySurfaceKHR(vk_instance, vk_surface, nullptr);
+	vkb::destroy_debug_utils_messenger(vk_instance, vk_debug_messenger);
 	vkDestroyInstance(vk_instance, nullptr);
 }
 
